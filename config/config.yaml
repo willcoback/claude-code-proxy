@@ -8,8 +8,8 @@ server:
 # Target model provider configuration
 provider:
   # Current active provider: grok (primary), auto-failover to fallback_providers
-  name: "gemini"
-  fallback_providers: ["grok"]
+  name: "grok"
+  fallback_providers: ["gemini"]
 
 # Gemini configuration
 gemini:

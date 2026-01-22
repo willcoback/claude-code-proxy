@@ -184,7 +184,6 @@ class GeminiStrategy(BaseModelStrategy):
                                 "name": block.get("name", ""),
                                 "args": block.get("input", {})
                             },
-                            "thoughtSignature": "skip_thought_signature_validator"
                         })
 
                     elif block_type == "tool_result":
@@ -487,7 +486,13 @@ class GeminiStrategy(BaseModelStrategy):
         logger.info(f"=== CONVERTED GEMINI REQUEST ===\n{format_json_for_log(request)}")
 
         response = await self._make_post_request(url, request, headers)
-        response_text = await response.text()
+        logger.info(f"Gemini non-stream response status: {response.status}")
+        try:
+            response_text = await response.text()
+        except Exception as e:
+            logger.error(f"Failed to read Gemini response body: {e}")
+            response.release()
+            raise
 
         logger.info(f"=== RAW GEMINI RESPONSE ===\n{format_json_for_log(response_text, max_str_length=15000)}")
 
@@ -541,10 +546,16 @@ class GeminiStrategy(BaseModelStrategy):
 
         # In stream_request:
         response = await self._make_post_request(url, request, headers)
+        logger.info(f"Gemini stream response status: {response.status}")
         if response.status != 200:
-            error_text = await response.text()
-            logger.error(f"Gemini streaming API error: {response.status} - {error_text}")
-            raise Exception(f"Gemini API error: {response.status} - {error_text}")
+            try:
+                body_bytes = await response.content.read()
+                error_text = body_bytes.decode('utf-8', errors='ignore')
+            except:
+                error_text = "No body (connection closed)"
+            logger.error(f"Gemini streaming API error {response.status}: {format_json_for_log(error_text)} | Headers: {dict(response.headers)}")
+            response.release()
+            raise Exception(f"Gemini API error: {response.status} - {error_text[:500]}")
 
         text_block_started = False
 
