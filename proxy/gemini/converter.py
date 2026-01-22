@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import random
 import uuid
 from typing import Any, AsyncGenerator, Dict, List
 
@@ -445,35 +446,37 @@ class GeminiStrategy(BaseModelStrategy):
             url += "?alt=sse"
         return url
 
-    async def _make_post_request(self, url: str, request: Dict[str, Any], headers: Dict[str, str], max_retries: int = 3) -> aiohttp.ClientResponse:
-        \"\"\"Helper for POST requests with 5xx retry logic.\"\"\"
-        for attempt in range(max_retries + 1):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                            url,
-                            json=request,
-                            headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=self.timeout)
-                    ) as response:
-                        if response.status < 500:
-                            return response
-                        response_text = await response.text()
-                        logger.warning(f"Gemini 5xx ({response.status}): attempt {attempt + 1}/{max_retries + 1} - {response_text[:200]}...")
-                        if attempt == max_retries:
-                            logger.error(f"Gemini API error after {max_retries + 1} attempts: {response.status}")
-                            raise Exception(f"Gemini API error: {response.status}")
-                        await asyncio.sleep(2 ** attempt)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                if attempt == max_retries:
-                    raise
-                logger.warning(f"Request error (attempt {attempt + 1}): {str(e)[:100]}")
-                await asyncio.sleep(2 ** attempt)
+    async def _make_post_request(self, url: str, request: Dict[str, Any], headers: Dict[str, str], max_retries: int = 5) -> aiohttp.ClientResponse:
+        """Helper for POST requests with retry on transient errors (429, 5xx)."""
+        transient_codes = {429, 502, 503, 504}
+        session = None
+        try:
+            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout))
+            for attempt in range(max_retries + 1):
+                async with session.post(url, json=request, headers=headers) as response:
+                    if response.status not in transient_codes:
+                        return response
+
+                    response_text = await response.text()
+                    delay = min(5 * (2 ** attempt) * random.uniform(0.8, 1.2), 120)
+                    logger.warning(f"Gemini transient ({response.status}): attempt {attempt + 1}/{max_retries + 1}, backoff {delay:.1f}s - {response_text[:200]}...")
+
+                    if attempt == max_retries:
+                        logger.error(f"Gemini max retries exceeded: {response.status}")
+                        raise Exception(f"Gemini API failed after {max_retries + 1} attempts: {response.status}")
+
+                    await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Request failed (final): {str(e)}")
+            raise
+        finally:
+            if session:
+                await session.close()
 
     async def send_request(self, request: Dict[str, Any]) -> ProxyResponse:
-        \"\"\"Send non-streaming request to Gemini API.\"\"\"
+        """Send non-streaming request to Gemini API."""
         url = self._get_api_url(stream=False)
         headers = {
             "Content-Type": "application/json",
@@ -543,148 +546,148 @@ class GeminiStrategy(BaseModelStrategy):
             logger.error(f"Gemini streaming API error: {response.status} - {error_text}")
             raise Exception(f"Gemini API error: {response.status} - {error_text}")
 
-            text_block_started = False
+        text_block_started = False
 
-            async for line in response.content:
-                line = line.decode('utf-8').strip()
+        async for line in response.content:
+            line = line.decode('utf-8').strip()
 
-                if not line or not line.startswith('data: '):
-                    continue
+            if not line or not line.startswith('data: '):
+                continue
 
-                json_str = line[6:]  # Remove 'data: ' prefix
-                if not json_str or json_str == '[DONE]':
-                    continue
+            json_str = line[6:]  # Remove 'data: ' prefix
+            if not json_str or json_str == '[DONE]':
+                continue
 
-                try:
-                    chunk = json.loads(json_str)
-                except json.JSONDecodeError:
-                    continue
+            try:
+                chunk = json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
 
-                # Log streaming chunk
-                logger.debug(f"=== GEMINI STREAM CHUNK ===\n{format_json_for_log(chunk, max_str_length=2000)}")
+            # Log streaming chunk
+            logger.debug(f"=== GEMINI STREAM CHUNK ===\n{format_json_for_log(chunk, max_str_length=2000)}")
 
-                # Extract usage metadata
-                usage_metadata = chunk.get("usageMetadata", {})
-                if usage_metadata:
-                    total_input_tokens = usage_metadata.get("promptTokenCount", total_input_tokens)
-                    total_output_tokens = usage_metadata.get("candidatesTokenCount", total_output_tokens)
+            # Extract usage metadata
+            usage_metadata = chunk.get("usageMetadata", {})
+            if usage_metadata:
+                total_input_tokens = usage_metadata.get("promptTokenCount", total_input_tokens)
+                total_output_tokens = usage_metadata.get("candidatesTokenCount", total_output_tokens)
 
-                candidates = chunk.get("candidates", [])
-                if not candidates:
-                    continue
+            candidates = chunk.get("candidates", [])
+            if not candidates:
+                continue
 
-                candidate = candidates[0]
-                content = candidate.get("content", {})
-                parts = content.get("parts", [])
+            candidate = candidates[0]
+            content = candidate.get("content", {})
+            parts = content.get("parts", [])
 
-                for part in parts:
-                    if "text" in part:
-                        text = part["text"]
+            for part in parts:
+                if "text" in part:
+                    text = part["text"]
 
-                        if not text_block_started:
-                            # Start content block
-                            yield {
-                                "type": "content_block_start",
-                                "index": content_block_index,
-                                "content_block": {"type": "text", "text": ""}
-                            }
-                            text_block_started = True
-
-                        # Send text delta
-                        yield {
-                            "type": "content_block_delta",
-                            "index": content_block_index,
-                            "delta": {"type": "text_delta", "text": text}
-                        }
-                        accumulated_text += text
-
-                    elif "functionCall" in part:
-                        # End previous text block if any
-                        if text_block_started:
-                            yield {
-                                "type": "content_block_stop",
-                                "index": content_block_index
-                            }
-                            content_block_index += 1
-                            text_block_started = False
-
-                        # Start tool use block
-                        func_call = part["functionCall"]
-                        tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
-
+                    if not text_block_started:
+                        # Start content block
                         yield {
                             "type": "content_block_start",
                             "index": content_block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tool_id,
-                                "name": func_call.get("name", ""),
-                                "input": {}
-                            }
+                            "content_block": {"type": "text", "text": ""}
                         }
+                        text_block_started = True
 
-                        # Send input as delta
-                        input_json = json.dumps(func_call.get("args", {}))
-                        yield {
-                            "type": "content_block_delta",
-                            "index": content_block_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": input_json
-                            }
-                        }
+                    # Send text delta
+                    yield {
+                        "type": "content_block_delta",
+                        "index": content_block_index,
+                        "delta": {"type": "text_delta", "text": text}
+                    }
+                    accumulated_text += text
 
-                        yield {
-                            "type": "content_block_stop",
-                            "index": content_block_index
-                        }
-
-                        tool_calls.append({
-                            "id": tool_id,
-                            "name": func_call.get("name", ""),
-                            "input": func_call.get("args", {})
-                        })
-                        content_block_index += 1
-
-                # Check for finish
-                finish_reason = candidate.get("finishReason")
-                if finish_reason:
+                elif "functionCall" in part:
+                    # End previous text block if any
                     if text_block_started:
                         yield {
                             "type": "content_block_stop",
                             "index": content_block_index
                         }
+                        content_block_index += 1
+                        text_block_started = False
 
-                    # Map stop reason
-                    stop_reason_map = {
-                        "STOP": "end_turn",
-                        "MAX_TOKENS": "max_tokens",
-                        "SAFETY": "stop_sequence"
-                    }
-                    stop_reason = stop_reason_map.get(finish_reason, "end_turn")
-                    if tool_calls:
-                        stop_reason = "tool_use"
+                    # Start tool use block
+                    func_call = part["functionCall"]
+                    tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
 
-                    # Send message_delta with stop_reason
                     yield {
-                        "type": "message_delta",
-                        "delta": {
-                            "stop_reason": stop_reason,
-                            "stop_sequence": None
-                        },
-                        "usage": {"output_tokens": total_output_tokens}
+                        "type": "content_block_start",
+                        "index": content_block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": func_call.get("name", ""),
+                            "input": {}
+                        }
                     }
 
-    # Send message_stop
-    yield {
-        "type": "message_stop"
-    }
+                    # Send input as delta
+                    input_json = json.dumps(func_call.get("args", {}))
+                    yield {
+                        "type": "content_block_delta",
+                        "index": content_block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": input_json
+                        }
+                    }
 
-    # Store final usage for logging
-    self._last_usage = TokenUsage(
-        input_tokens=total_input_tokens,
-        output_tokens=total_output_tokens
-    )
+                    yield {
+                        "type": "content_block_stop",
+                        "index": content_block_index
+                    }
+
+                    tool_calls.append({
+                        "id": tool_id,
+                        "name": func_call.get("name", ""),
+                        "input": func_call.get("args", {})
+                    })
+                    content_block_index += 1
+
+            # Check for finish
+            finish_reason = candidate.get("finishReason")
+            if finish_reason:
+                if text_block_started:
+                    yield {
+                        "type": "content_block_stop",
+                        "index": content_block_index
+                    }
+
+                # Map stop reason
+                stop_reason_map = {
+                    "STOP": "end_turn",
+                    "MAX_TOKENS": "max_tokens",
+                    "SAFETY": "stop_sequence"
+                }
+                stop_reason = stop_reason_map.get(finish_reason, "end_turn")
+                if tool_calls:
+                    stop_reason = "tool_use"
+
+                # Send message_delta with stop_reason
+                yield {
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": stop_reason,
+                        "stop_sequence": None
+                    },
+                    "usage": {"output_tokens": total_output_tokens}
+                }
+
+        # Send message_stop
+        yield {
+            "type": "message_stop"
+        }
+
+        # Store final usage for logging
+        self._last_usage = TokenUsage(
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens
+        )
 
 
 # Register strategy with factory

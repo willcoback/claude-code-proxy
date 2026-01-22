@@ -129,103 +129,123 @@ async def messages(request: Request):
         logger.info(f"[{request_id}] Received request | stream={stream} | model={body.get('model', 'unknown')}")
         logger.info(f"[{request_id}] === ORIGINAL CLAUDE REQUEST ===\n{format_json_for_log(body)}")
 
-        # Get strategy for current provider
-        strategy = get_strategy()
-        model_name = strategy.model
+        providers = [config.provider_name] + config.get("provider.fallback_providers", [])
+        used_provider = None
+        used_model = None
 
-        if stream:
-            # Handle streaming response
-            async def generate_stream():
-                total_input_tokens = 0
-                total_output_tokens = 0
+        for provider_name in providers:
+            try:
+                provider_config = config.get_provider_config(provider_name)
+                strategy = StrategyFactory.get_strategy(provider_name, provider_config)
+                model_name = strategy.model
+                used_provider = provider_name
+                used_model = model_name
+                logger.info(f"[{request_id}] Using provider: {provider_name} ({model_name})")
 
-                try:
-                    # Convert request and get streaming response
-                    target_request = strategy.convert_request(body)
-                    async for chunk in strategy.stream_request(target_request):
-                        # Track tokens from message_start
-                        if chunk.get("type") == "message_start":
-                            usage = chunk.get("message", {}).get("usage", {})
-                            total_input_tokens = usage.get("input_tokens", 0)
+                if stream:
+                    # Handle streaming response
+                    async def generate_stream():
+                        total_input_tokens = 0
+                        total_output_tokens = 0
 
-                        # Track tokens from message_delta
-                        if chunk.get("type") == "message_delta":
-                            usage = chunk.get("usage", {})
-                            total_output_tokens = usage.get("output_tokens", total_output_tokens)
+                        try:
+                            # Convert request and get streaming response
+                            target_request = strategy.convert_request(body)
+                            async for chunk in strategy.stream_request(target_request):
+                                # Track tokens from message_start
+                                if chunk.get("type") == "message_start":
+                                    usage = chunk.get("message", {}).get("usage", {})
+                                    total_input_tokens = usage.get("input_tokens", 0)
 
-                        # Send chunk as SSE with correct event type
-                        chunk_json = json.dumps(chunk, ensure_ascii=False)
-                        event_type = chunk.get("type", "message")
-                        yield f"event: {event_type}\ndata: {chunk_json}\n\n"
+                                # Track tokens from message_delta
+                                if chunk.get("type") == "message_delta":
+                                    usage = chunk.get("usage", {})
+                                    total_output_tokens = usage.get("output_tokens", total_output_tokens)
 
-                    # Get final usage if available
-                    if hasattr(strategy, '_last_usage'):
-                        total_input_tokens = strategy._last_usage.input_tokens
-                        total_output_tokens = strategy._last_usage.output_tokens
+                                # Send chunk as SSE with correct event type
+                                chunk_json = json.dumps(chunk, ensure_ascii=False)
+                                event_type = chunk.get("type", "message")
+                                yield f"event: {event_type}\ndata: {chunk_json}\n\n"
+
+                            # Get final usage if available
+                            if hasattr(strategy, '_last_usage'):
+                                total_input_tokens = strategy._last_usage.input_tokens
+                                total_output_tokens = strategy._last_usage.output_tokens
+
+                            # Log request
+                            log_request(
+                                logger=logger,
+                                model_name=f"{used_provider}:{used_model}",
+                                input_tokens=total_input_tokens,
+                                output_tokens=total_output_tokens,
+                                request_id=request_id,
+                                status="success"
+                            )
+
+                        except Exception as e:
+                            logger.error(f"[{request_id}] Streaming error with {provider_name}: {str(e)}")
+                            error_chunk = {
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": str(e)
+                                }
+                            }
+                            yield f"event: error\ndata: {json.dumps(error_chunk)}\n\n"
+
+                            log_request(
+                                logger=logger,
+                                model_name=f"{used_provider}:{used_model}",
+                                input_tokens=0,
+                                output_tokens=0,
+                                request_id=request_id,
+                                status="error"
+                            )
+
+                    return StreamingResponse(
+                        generate_stream(),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Request-Id": request_id
+                        }
+                    )
+
+                else:
+                    # Handle non-streaming response
+                    response = await strategy.proxy(body, stream=False)
 
                     # Log request
                     log_request(
                         logger=logger,
-                        model_name=model_name,
-                        input_tokens=total_input_tokens,
-                        output_tokens=total_output_tokens,
+                        model_name=f"{used_provider}:{used_model}",
+                        input_tokens=response.usage.input_tokens,
+                        output_tokens=response.usage.output_tokens,
                         request_id=request_id,
                         status="success"
                     )
 
-                except Exception as e:
-                    logger.error(f"[{request_id}] Streaming error: {str(e)}")
-                    error_chunk = {
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": str(e)
-                        }
-                    }
-                    yield f"event: error\ndata: {json.dumps(error_chunk)}\n\n"
-
-                    log_request(
-                        logger=logger,
-                        model_name=model_name,
-                        input_tokens=0,
-                        output_tokens=0,
-                        request_id=request_id,
-                        status="error"
+                    logger.info(
+                        f"[{request_id}] Request completed | "
+                        f"provider: {used_provider} | "
+                        f"tokens: {response.usage.total_tokens}"
                     )
 
-            return StreamingResponse(
-                generate_stream(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Request-Id": request_id
-                }
-            )
+                    return JSONResponse(
+                        content=response.data,
+                        headers={"X-Request-Id": request_id}
+                    )
 
-        else:
-            # Handle non-streaming response
-            response = await strategy.proxy(body, stream=False)
+            except Exception as e:
+                logger.warning(f"[{request_id}] Provider {provider_name} failed: {str(e)} | Trying next...")
+                continue
 
-            # Log request
-            log_request(
-                logger=logger,
-                model_name=model_name,
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
-                request_id=request_id,
-                status="success"
-            )
-
-            logger.info(
-                f"[{request_id}] Request completed | "
-                f"tokens: {response.usage.total_tokens}"
-            )
-
-            return JSONResponse(
-                content=response.data,
-                headers={"X-Request-Id": request_id}
-            )
+        # All providers failed
+        raise HTTPException(
+            status_code=500,
+            detail=f"All providers failed: {', '.join(providers)}"
+        )
 
     except Exception as e:
         logger.error(f"[{request_id}] Error processing request: {str(e)}", exc_info=True)
