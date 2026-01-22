@@ -1,0 +1,30 @@
+# Claude Code Proxy Configuration
+
+# Server configuration
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+# Target model provider configuration
+provider:
+  # Current active provider: gemini, grok, etc.
+  name: "grok"
+
+# Gemini configuration
+gemini:
+  api_key: "${GEMINI_API_KEY}"
+  model: "gemini-3-flash-preview"
+  base_url: "https://generativelanguage.googleapis.com/v1beta"
+  timeout: 300
+
+# Grok configuration
+grok:
+  api_key: "${GROK_API_KEY}"
+  model: "grok-4-1-fast-reasoning"
+  base_url: "https://api.x.ai/v1"
+  timeout: 300
+
+# Logging configuration
+logging:
+  level: "INFO"
+  dir: "./logs"
