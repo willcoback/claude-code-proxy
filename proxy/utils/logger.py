@@ -6,8 +6,67 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 
+class ProviderFilter(logging.Filter):
+    def __init__(self, provider: str = "system"):
+        super().__init__()
+        self.provider = provider
+
+    def filter(self, record):
+        # Ensure provider field always exists
+        if not hasattr(record, 'provider'):
+            record.provider = self.provider
+        return True
+
+
+class HourlyRotatingFileHandler(TimedRotatingFileHandler):
+    """Custom hourly rotating file handler with timestamp in filename."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Set suffix format for rotation
+        self.suffix = "%Y-%m-%d_%H"
+        self.extMatch = None
+
+    def rotation_filename(self, source_filename, date_str):
+        """Generate rotated filename with timestamp."""
+        log_path = Path(source_filename).parent
+        basename = Path(source_filename).stem.split('-')[0]  # Get 'proxy' from 'proxy-2026-01-23_13'
+        return str(log_path / f"{basename}-{date_str}.log")
+
+    def doRollover(self):
+        """Override to handle rollover with custom filename format."""
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        # Get current time for new filename
+        current_time = datetime.now()
+        new_filename = self.get_current_filename()
+
+        # Update baseFilename to new time-based filename
+        self.baseFilename = new_filename
+
+        # Open new log file
+        self.mode = 'a'
+        self.stream = self._open()
+
+        # Calculate next rollover time
+        current_time_sec = self.rolloverAt - self.interval
+        new_rollover_at = self.computeRollover(current_time_sec)
+        while new_rollover_at <= current_time.timestamp():
+            new_rollover_at = new_rollover_at + self.interval
+        self.rolloverAt = new_rollover_at
+
+    def get_current_filename(self):
+        """Get filename for current hour."""
+        log_path = Path(self.baseFilename).parent
+        basename = Path(self.baseFilename).stem.split('-')[0]  # Get 'proxy' part
+        current_hour = datetime.now().strftime('%Y-%m-%d_%H')
+        return str(log_path / f"{basename}-{current_hour}.log")
+
+
 class ProxyLogger:
-    """Custom logger for claude-code-proxy with daily rotation."""
+    """Custom logger for claude-code-proxy with hourly rotation."""
 
     _loggers = {}
 
@@ -16,7 +75,8 @@ class ProxyLogger:
             cls,
             name: str = "claude-code-proxy",
             log_dir: str = "./logs",
-            level: str = "INFO"
+            level: str = "INFO",
+            provider: str = None
     ) -> logging.Logger:
         """
         Setup and return a logger with console and daily rotating file handlers.
@@ -25,12 +85,22 @@ class ProxyLogger:
             name: Logger name
             log_dir: Directory for log files
             level: Logging level
+            provider: Provider name for log format
 
         Returns:
             Configured logger instance
         """
         if name in cls._loggers:
-            return cls._loggers[name]
+            logger = cls._loggers[name]
+            # Update provider filter if it exists
+            for f in logger.filters:
+                if isinstance(f, ProviderFilter):
+                    f.provider = provider if provider else "system"
+                    break
+            else:
+                # No filter found, add one
+                logger.addFilter(ProviderFilter(provider if provider else "system"))
+            return logger
 
         # Create logs directory if not exists
         log_path = Path(log_dir)
@@ -43,31 +113,35 @@ class ProxyLogger:
 
         # Create formatters
         file_formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)s | %(message)s',
+            '%(asctime)s | %(levelname)s|%(provider)s| | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         console_formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)s | %(message)s',
+            '%(asctime)s | %(levelname)s|%(provider)s| | %(message)s',
             datefmt='%H:%M:%S'
         )
 
-        # Daily rotating file handler
-        log_file = log_path / f"proxy_{datetime.now().strftime('%Y-%m-%d')}.log"
-        file_handler = TimedRotatingFileHandler(
+        # Hourly rotating file handler with timestamp in filename
+        current_hour = datetime.now().strftime('%Y-%m-%d_%H')
+        log_file = log_path / f"proxy-{current_hour}.log"
+        file_handler = HourlyRotatingFileHandler(
             filename=str(log_file),
-            when='midnight',
+            when='H',
             interval=1,
-            backupCount=30,
-            encoding='utf-8'
+            backupCount=1680,  # ~70 days
+            encoding='utf-8',
+            utc=False
         )
         file_handler.setFormatter(file_formatter)
-        file_handler.suffix = "%Y-%m-%d.log"
         logger.addHandler(file_handler)
 
         # Console handler
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
+
+        # Always add provider filter with default value if not specified
+        logger.addFilter(ProviderFilter(provider if provider else "system"))
 
         cls._loggers[name] = logger
         return logger
@@ -83,10 +157,11 @@ class ProxyLogger:
 def setup_logger(
         name: str = "claude-code-proxy",
         log_dir: str = "./logs",
-        level: str = "INFO"
+        level: str = "INFO",
+        provider: str = None
 ) -> logging.Logger:
     """Convenience function to setup logger."""
-    return ProxyLogger.setup_logger(name, log_dir, level)
+    return ProxyLogger.setup_logger(name, log_dir, level, provider)
 
 
 def get_logger(name: str = "claude-code-proxy") -> logging.Logger:

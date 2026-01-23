@@ -298,7 +298,6 @@ class GrokStrategy(BaseModelStrategy):
         }
 
         logger.info(f"Sending request to Grok: {url}")
-        logger.info(f"=== CONVERTED GROK REQUEST ===\n{format_json_for_log(request)}")
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -336,7 +335,6 @@ class GrokStrategy(BaseModelStrategy):
         }
 
         logger.info(f"Sending streaming request to Grok: {url}")
-        logger.info(f"=== CONVERTED GROK REQUEST (STREAM) ===\n{format_json_for_log(request)}")
         logger.info(f"Tools count: {len(request.get('tools', []))}")
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"

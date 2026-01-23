@@ -14,16 +14,17 @@ provider:
 # Gemini configuration
 gemini:
   api_key: "${GEMINI_API_KEY}"
-  model: "gemini-3-flash-preview"
-  base_url: "https://generativelanguage.googleapis.com/v1beta"
-  timeout: 300
+  model: "gemini-2.5-flash"  # 使用 Gemini 3，测试 thought_signature 缓存
+  base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+  timeout: 600
+  proxy: ""  # Optional HTTP/HTTPS proxy (e.g., "http://127.0.0.1:7890")
 
 # Grok configuration
 grok:
   api_key: "${GROK_API_KEY}"
-  model: "grok-4-1-fast-reasoning"
+  model: "grok-code-fast-1"
   base_url: "https://api.x.ai/v1"
-  timeout: 300
+  timeout: 600
 
 # Logging configuration
 logging:

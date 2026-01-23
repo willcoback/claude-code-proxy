@@ -75,7 +75,8 @@ config.load()
 logger = setup_logger(
     name="claude-code-proxy",
     log_dir=config.get("logging.dir", "./logs"),
-    level=config.get("logging.level", "INFO")
+    level=config.get("logging.level", "INFO"),
+    provider=config.get_provider_config().get('model', 'system')
 )
 
 # Create FastAPI app
@@ -127,7 +128,6 @@ async def messages(request: Request):
         stream = body.get("stream", False)
 
         logger.info(f"[{request_id}] Received request | stream={stream} | model={body.get('model', 'unknown')}")
-        logger.info(f"[{request_id}] === ORIGINAL CLAUDE REQUEST ===\n{format_json_for_log(body)}")
 
         providers = [config.provider_name] + config.get("provider.fallback_providers", [])
         used_provider = None

@@ -1,29 +1,24 @@
-"""Gemini model strategy implementation."""
+"""Gemini OpenAI compatible model strategy implementation."""
 
-import asyncio
 import json
-import random
+import ssl
 import uuid
-from typing import Any, AsyncGenerator, Dict, List
+from typing import Any, AsyncGenerator, Dict
 
 import aiohttp
+import certifi
+import httpx
+from openai import AsyncOpenAI
 
 from ..base.strategy import BaseModelStrategy, StrategyFactory, TokenUsage, ProxyResponse
 from ..utils import get_logger
+from ..utils.thought_cache import ThoughtSignatureCache
 
 logger = get_logger()
-
 
 def truncate_value(value: Any, max_str_length: int = 500) -> Any:
     """
     Recursively truncate long string values while preserving JSON structure.
-
-    Args:
-        value: The value to truncate
-        max_str_length: Maximum length for string values
-
-    Returns:
-        Truncated value with structure preserved
     """
     if isinstance(value, str):
         if len(value) > max_str_length:
@@ -32,7 +27,6 @@ def truncate_value(value: Any, max_str_length: int = 500) -> Any:
     elif isinstance(value, dict):
         return {k: truncate_value(v, max_str_length) for k, v in value.items()}
     elif isinstance(value, list):
-        # For very long lists, truncate the list itself
         if len(value) > 20:
             truncated_list = [truncate_value(item, max_str_length) for item in value[:20]]
             truncated_list.append(f"... [{len(value) - 20} more items]")
@@ -41,17 +35,9 @@ def truncate_value(value: Any, max_str_length: int = 500) -> Any:
     else:
         return value
 
-
 def format_json_for_log(data: Any, max_str_length: int = 500) -> str:
     """
-    Format JSON data for logging, truncating long field values while preserving structure.
-
-    Args:
-        data: The data to format
-        max_str_length: Maximum length for individual string values
-
-    Returns:
-        Formatted JSON string with truncated values
+    Format JSON data for logging.
     """
     try:
         truncated_data = truncate_value(data, max_str_length)
@@ -59,477 +45,330 @@ def format_json_for_log(data: Any, max_str_length: int = 500) -> str:
     except Exception:
         return str(data)[:5000]
 
-
-# JSON Schema fields not supported by Gemini API
-UNSUPPORTED_SCHEMA_FIELDS = {
-    "$schema",
-    "additionalProperties",
-    "exclusiveMinimum",
-    "exclusiveMaximum",
-    "propertyNames",
-    "patternProperties",
-    "unevaluatedProperties",
-    "unevaluatedItems",
-    "const",
-    "contentEncoding",
-    "contentMediaType",
-    "$id",
-    "$ref",
-    "$defs",
-    "definitions",
-    "if",
-    "then",
-    "else",
-    "allOf",
-    "anyOf",
-    "oneOf",
-    "not",
-    "dependentRequired",
-    "dependentSchemas",
-}
-
-
-def sanitize_schema_for_gemini(schema: Any) -> Any:
-    """
-    Recursively remove JSON Schema fields not supported by Gemini API.
-
-    Gemini only supports a subset of OpenAPI/JSON Schema:
-    - type, description, enum, properties, required, items, format
-    - minimum, maximum, minItems, maxItems, minLength, maxLength
-    """
-    if not isinstance(schema, dict):
-        return schema
-
-    cleaned = {}
-    for key, value in schema.items():
-        # Skip unsupported fields
-        if key in UNSUPPORTED_SCHEMA_FIELDS:
-            continue
-
-        # Recursively clean nested structures
-        if key == "properties" and isinstance(value, dict):
-            cleaned[key] = {
-                prop_name: sanitize_schema_for_gemini(prop_schema)
-                for prop_name, prop_schema in value.items()
-            }
-        elif key == "items" and isinstance(value, dict):
-            cleaned[key] = sanitize_schema_for_gemini(value)
-        elif key == "items" and isinstance(value, list):
-            cleaned[key] = [sanitize_schema_for_gemini(item) for item in value]
-        elif isinstance(value, dict):
-            cleaned[key] = sanitize_schema_for_gemini(value)
-        elif isinstance(value, list):
-            cleaned[key] = [
-                sanitize_schema_for_gemini(item) if isinstance(item, dict) else item
-                for item in value
-            ]
-        else:
-            cleaned[key] = value
-
-    return cleaned
-
-
 class GeminiStrategy(BaseModelStrategy):
     """
-    Strategy for converting between Claude and Gemini API formats.
-
-    Handles:
-    - Request format conversion (Claude -> Gemini)
-    - Response format conversion (Gemini -> Claude)
-    - Streaming response handling
+    Strategy for converting between Claude and Gemini OpenAI compatible API formats.
+    Gemini OpenAI API is compatible with OpenAI format.
     """
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.proxy = config.get('proxy', '')  # HTTP/HTTPS proxy URL
+        self.thought_cache = ThoughtSignatureCache()  # Initialize thought signature cache
+        # Cleanup old cache entries on startup
+        self.thought_cache.cleanup_old_entries(max_age_seconds=3600, max_entries=1000)
+        logger.info(f"Thought signature cache initialized: {self.thought_cache.get_stats()}")
 
     @property
     def provider_name(self) -> str:
         return "gemini"
 
-    def _convert_content_to_parts(self, content: Any) -> List[Dict[str, Any]]:
-        """
-        Convert Claude content format to Gemini parts format.
-
-        Claude content can be:
-        - string: simple text
-        - list: array of content blocks (text, image, tool_use, tool_result)
-        """
-        parts = []
-
-        if isinstance(content, str):
-            parts.append({"text": content})
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, str):
-                    parts.append({"text": block})
-                elif isinstance(block, dict):
-                    block_type = block.get("type", "")
-
-                    if block_type == "text":
-                        parts.append({"text": block.get("text", "")})
-
-                    elif block_type == "image":
-                        # Handle base64 image
-                        source = block.get("source", {})
-                        if source.get("type") == "base64":
-                            parts.append({
-                                "inline_data": {
-                                    "mime_type": source.get("media_type", "image/png"),
-                                    "data": source.get("data", "")
-                                }
-                            })
-
-                    elif block_type == "tool_use":
-                        # Claude tool_use -> Gemini functionCall
-                        # Gemini 3 requires thoughtSignature for function calls
-                        parts.append({
-                            "functionCall": {
-                                "name": block.get("name", ""),
-                                "args": block.get("input", {})
-                            },
-                        })
-
-                    elif block_type == "tool_result":
-                        # Claude tool_result -> Gemini functionResponse
-                        tool_result_content = block.get("content", "")
-                        if isinstance(tool_result_content, list):
-                            # Extract text from content blocks
-                            text_parts = []
-                            for item in tool_result_content:
-                                if isinstance(item, dict) and item.get("type") == "text":
-                                    text_parts.append(item.get("text", ""))
-                                elif isinstance(item, str):
-                                    text_parts.append(item)
-                            tool_result_content = "\n".join(text_parts)
-
-                        parts.append({
-                            "functionResponse": {
-                                "name": block.get("tool_use_id", ""),
-                                "response": {"result": tool_result_content}
-                            }
-                        })
-
-        return parts if parts else [{"text": ""}]
-
-    def _convert_tools_to_gemini(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Convert Claude tools format to Gemini function declarations.
-
-        Claude tool schemas may include JSON Schema fields not supported by Gemini,
-        such as $schema, additionalProperties, exclusiveMinimum, propertyNames, etc.
-        These are sanitized before sending to Gemini.
-        """
-        if not tools:
-            return []
-
-        function_declarations = []
-        for tool in tools:
-            if tool.get("type") == "function":
-                func = tool.get("function", {})
-                parameters = sanitize_schema_for_gemini(func.get("parameters", {}))
-                function_declarations.append({
-                    "name": func.get("name", ""),
-                    "description": func.get("description", ""),
-                    "parameters": parameters
-                })
-            elif "name" in tool:
-                # Claude native tool format
-                parameters = sanitize_schema_for_gemini(tool.get("input_schema", {}))
-                function_declarations.append({
-                    "name": tool.get("name", ""),
-                    "description": tool.get("description", ""),
-                    "parameters": parameters
-                })
-
-        return [{"functionDeclarations": function_declarations}] if function_declarations else []
-
     def convert_request(self, claude_request: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Convert Claude API request to Gemini API request.
-
-        Claude format:
-        {
-            "model": "claude-3-5-sonnet-...",
-            "max_tokens": 1024,
-            "messages": [...],
-            "system": "...",
-            "tools": [...]
-        }
-
-        Gemini format:
-        {
-            "contents": [...],
-            "systemInstruction": {...},
-            "generationConfig": {...},
-            "tools": [...]
-        }
+        Convert Claude API request to Gemini OpenAI (OpenAI-compatible) API request.
         """
-        gemini_request = {}
+        gemini_request = {
+            "model": self.model,
+            "stream": claude_request.get("stream", False),
+        }
 
-        # Convert messages to contents
-        contents = []
-        messages = claude_request.get("messages", [])
+        # Convert messages
+        messages = []
 
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-
-            # Map Claude roles to Gemini roles
-            gemini_role = "model" if role == "assistant" else "user"
-
-            parts = self._convert_content_to_parts(content)
-            contents.append({
-                "role": gemini_role,
-                "parts": parts
-            })
-
-        gemini_request["contents"] = contents
-
-        # Convert system prompt
+        # Add system message if present
         system = claude_request.get("system")
         if system:
             if isinstance(system, str):
-                gemini_request["systemInstruction"] = {
-                    "parts": [{"text": system}]
-                }
+                messages.append({"role": "system", "content": system})
             elif isinstance(system, list):
-                # Handle system as array of content blocks
                 system_text = []
                 for block in system:
                     if isinstance(block, str):
                         system_text.append(block)
                     elif isinstance(block, dict) and block.get("type") == "text":
                         system_text.append(block.get("text", ""))
-                gemini_request["systemInstruction"] = {
-                    "parts": [{"text": "\n".join(system_text)}]
-                }
+                messages.append({"role": "system", "content": "\n".join(system_text)})
 
-        # Generation config
-        generation_config = {}
+        for msg in claude_request.get("messages", []):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
 
+            if isinstance(content, list):
+                text_parts = []
+                tool_uses = []
+                tool_results = []
+
+                for block in content:
+                    if isinstance(block, str):
+                        text_parts.append(block)
+                    elif isinstance(block, dict):
+                        block_type = block.get("type", "")
+                        if block_type == "text":
+                            text_parts.append(block.get("text", ""))
+                        elif block_type == "tool_use":
+                            tool_call_id = block.get("id", "")
+                            tool_call = {
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name", ""),
+                                    "arguments": json.dumps(block.get("input", {}))
+                                }
+                            }
+
+                            # Try to get thought_signature from cache
+                            thought_signature = self.thought_cache.get_signature(tool_call_id)
+                            if thought_signature:
+                                logger.info(f"Found cached thought_signature for tool_call {tool_call_id}")
+                                tool_call["extra_content"] = {
+                                    "google": {
+                                        "thought_signature": thought_signature
+                                    }
+                                }
+
+                            tool_uses.append(tool_call)
+                        elif block_type == "tool_result":
+                            tool_result_content = block.get("content", "")
+                            if isinstance(tool_result_content, list):
+                                parts = []
+                                for item in tool_result_content:
+                                    if isinstance(item, dict) and item.get("type") == "text":
+                                        parts.append(item.get("text", ""))
+                                    elif isinstance(item, str):
+                                        parts.append(item)
+                                tool_result_content = "\n".join(parts)
+                            tool_results.append({
+                                "tool_call_id": block.get("tool_use_id", ""),
+                                "content": tool_result_content
+                            })
+
+                # If assistant message with tool_use
+                if role == "assistant" and tool_uses:
+                    assistant_msg = {"role": "assistant"}
+                    if text_parts:
+                        assistant_msg["content"] = "\n".join(text_parts)
+                    else:
+                        assistant_msg["content"] = None
+                    assistant_msg["tool_calls"] = tool_uses
+                    messages.append(assistant_msg)
+                # If user message with tool_result
+                elif tool_results:
+                    for tr in tool_results:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tr["tool_call_id"],
+                            "content": tr["content"]
+                        })
+                else:
+                    messages.append({
+                        "role": role,
+                        "content": "\n".join(text_parts) if text_parts else ""
+                    })
+            else:
+                messages.append({
+                    "role": role,
+                    "content": content
+                })
+
+        gemini_request["messages"] = messages
+
+        # Add common parameters
         if "max_tokens" in claude_request:
-            generation_config["maxOutputTokens"] = claude_request["max_tokens"]
+            gemini_request["max_tokens"] = claude_request["max_tokens"]
 
         if "temperature" in claude_request:
-            generation_config["temperature"] = claude_request["temperature"]
+            gemini_request["temperature"] = claude_request["temperature"]
 
         if "top_p" in claude_request:
-            generation_config["topP"] = claude_request["top_p"]
-
-        if "top_k" in claude_request:
-            generation_config["topK"] = claude_request["top_k"]
+            gemini_request["top_p"] = claude_request["top_p"]
 
         if "stop_sequences" in claude_request:
-            generation_config["stopSequences"] = claude_request["stop_sequences"]
+            gemini_request["stop"] = claude_request["stop_sequences"]
 
-        if generation_config:
-            gemini_request["generationConfig"] = generation_config
-
-        # Convert tools
+        # Convert tools (Claude format -> OpenAI/Gemini OpenAI format)
         tools = claude_request.get("tools", [])
         if tools:
-            gemini_tools = self._convert_tools_to_gemini(tools)
-            if gemini_tools:
-                gemini_request["tools"] = gemini_tools
+            gemini_tools = []
+            for tool in tools:
+                # Clean parameters - remove unsupported JSON Schema fields
+                parameters = tool.get("input_schema", {})
+                cleaned_params = self._clean_json_schema(parameters)
+
+                gemini_tool = {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                        "parameters": cleaned_params
+                    }
+                }
+                gemini_tools.append(gemini_tool)
+            gemini_request["tools"] = gemini_tools
+            # Enable tool choice - let model decide when to use tools
+            gemini_request["tool_choice"] = "auto"
 
         return gemini_request
 
-    def _convert_parts_to_content(self, parts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Convert Gemini parts to Claude content blocks."""
-        content_blocks = []
+    def _clean_json_schema(self, schema: Any) -> Any:
+        """Remove unsupported JSON Schema fields for Gemini OpenAI API."""
+        if not isinstance(schema, dict):
+            return schema
 
-        for part in parts:
-            if "text" in part:
-                content_blocks.append({
-                    "type": "text",
-                    "text": part["text"]
-                })
+        # Fields not supported by OpenAI/Gemini OpenAI API
+        unsupported = {
+            "$schema", "additionalProperties", "exclusiveMinimum", "exclusiveMaximum",
+            "$id", "$ref", "$defs", "definitions", "if", "then", "else",
+            "allOf", "anyOf", "oneOf", "not", "propertyNames", "patternProperties",
+            "unevaluatedProperties", "unevaluatedItems", "const", "contentEncoding",
+            "contentMediaType", "dependentRequired", "dependentSchemas"
+        }
 
-            elif "functionCall" in part:
-                func_call = part["functionCall"]
-                content_blocks.append({
-                    "type": "tool_use",
-                    "id": f"toolu_{uuid.uuid4().hex[:24]}",
-                    "name": func_call.get("name", ""),
-                    "input": func_call.get("args", {})
-                })
+        cleaned = {}
+        for key, value in schema.items():
+            if key in unsupported:
+                continue
+            if key == "properties" and isinstance(value, dict):
+                cleaned[key] = {k: self._clean_json_schema(v) for k, v in value.items()}
+            elif key == "items":
+                cleaned[key] = self._clean_json_schema(value) if isinstance(value, dict) else value
+            elif isinstance(value, dict):
+                cleaned[key] = self._clean_json_schema(value)
+            elif isinstance(value, list):
+                cleaned[key] = [self._clean_json_schema(item) if isinstance(item, dict) else item for item in value]
+            else:
+                cleaned[key] = value
 
-        return content_blocks
+        return cleaned
 
     def convert_response(self, gemini_response: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Convert Gemini API response to Claude API response.
-
-        Gemini format:
-        {
-            "candidates": [{
-                "content": {"role": "model", "parts": [...]},
-                "finishReason": "STOP"
-            }],
-            "usageMetadata": {...}
-        }
-
-        Claude format:
-        {
-            "id": "msg_...",
-            "type": "message",
-            "role": "assistant",
-            "content": [...],
-            "model": "...",
-            "stop_reason": "...",
-            "usage": {...}
-        }
+        Convert Gemini OpenAI (OpenAI-compatible) response to Claude format.
         """
-        # Generate unique message ID
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
-        # Extract content from candidates
-        content_blocks = []
+        choices = gemini_response.get("choices", [])
+        content = []
         stop_reason = "end_turn"
 
-        candidates = gemini_response.get("candidates", [])
-        if candidates:
-            candidate = candidates[0]
-            content = candidate.get("content", {})
-            parts = content.get("parts", [])
+        if choices:
+            choice = choices[0]
+            message = choice.get("message", {})
 
-            content_blocks = self._convert_parts_to_content(parts)
+            # Handle text content
+            content_text = message.get("content", "")
+            if content_text:
+                content.append({"type": "text", "text": content_text})
 
-            # Map finish reason
-            finish_reason = candidate.get("finishReason", "STOP")
-            stop_reason_map = {
-                "STOP": "end_turn",
-                "MAX_TOKENS": "max_tokens",
-                "SAFETY": "stop_sequence",
-                "RECITATION": "stop_sequence",
-                "OTHER": "end_turn"
-            }
-            stop_reason = stop_reason_map.get(finish_reason, "end_turn")
+            # Handle tool calls
+            tool_calls = message.get("tool_calls", [])
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                try:
+                    args = json.loads(func.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    args = {}
 
-            # Check if there's a tool use, adjust stop_reason
-            for block in content_blocks:
-                if block.get("type") == "tool_use":
-                    stop_reason = "tool_use"
-                    break
+                tool_call_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
 
-        # Extract usage
-        usage_metadata = gemini_response.get("usageMetadata", {})
+                # Extract and cache thought_signature if present
+                extra_content = tc.get("extra_content", {})
+                google_data = extra_content.get("google", {})
+                thought_signature = google_data.get("thought_signature")
+
+                if thought_signature:
+                    logger.info(f"Storing thought_signature for tool_call {tool_call_id}")
+                    self.thought_cache.store_signature(tool_call_id, thought_signature, msg_id)
+
+                content.append({
+                    "type": "tool_use",
+                    "id": tool_call_id,
+                    "name": func.get("name", ""),
+                    "input": args
+                })
+
+            finish_reason = choice.get("finish_reason")
+            if finish_reason == "length":
+                stop_reason = "max_tokens"
+            elif finish_reason == "stop":
+                stop_reason = "end_turn"
+            elif finish_reason == "tool_calls":
+                stop_reason = "tool_use"
+
+        # Ensure content is not empty
+        if not content:
+            content = [{"type": "text", "text": ""}]
+
+        usage_data = gemini_response.get("usage", {})
         usage = {
-            "input_tokens": usage_metadata.get("promptTokenCount", 0),
-            "output_tokens": usage_metadata.get("candidatesTokenCount", 0)
+            "input_tokens": usage_data.get("prompt_tokens", 0),
+            "output_tokens": usage_data.get("completion_tokens", 0)
         }
 
-        claude_response = {
+        return {
             "id": msg_id,
             "type": "message",
             "role": "assistant",
-            "content": content_blocks if content_blocks else [{"type": "text", "text": ""}],
+            "content": content,
             "model": self.model,
             "stop_reason": stop_reason,
             "stop_sequence": None,
             "usage": usage
         }
 
-        return claude_response
-
     def get_token_usage(self, response: Dict[str, Any]) -> TokenUsage:
-        """Extract token usage from Gemini response."""
-        usage_metadata = response.get("usageMetadata", {})
+        usage_data = response.get("usage", {})
         return TokenUsage(
-            input_tokens=usage_metadata.get("promptTokenCount", 0),
-            output_tokens=usage_metadata.get("candidatesTokenCount", 0),
-            total_tokens=usage_metadata.get("totalTokenCount", 0)
+            input_tokens=usage_data.get("prompt_tokens", 0),
+            output_tokens=usage_data.get("completion_tokens", 0),
+            total_tokens=usage_data.get("total_tokens", 0)
         )
-
-    def _get_api_url(self, stream: bool = False) -> str:
-        """Get the API URL for Gemini."""
-        action = "streamGenerateContent" if stream else "generateContent"
-        url = f"{self.base_url}/models/{self.model}:{action}"
-        if stream:
-            url += "?alt=sse"
-        return url
-
-    async def _make_post_request(self, url: str, request: Dict[str, Any], headers: Dict[str, str], max_retries: int = 5) -> aiohttp.ClientResponse:
-        """Helper for POST requests with retry on transient errors (429, 5xx)."""
-        transient_codes = {429, 502, 503, 504}
-        session = None
-        try:
-            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout))
-            for attempt in range(max_retries + 1):
-                async with session.post(url, json=request, headers=headers) as response:
-                    if response.status not in transient_codes:
-                        return response
-
-                    response_text = await response.text()
-                    delay = min(5 * (2 ** attempt) * random.uniform(0.8, 1.2), 120)
-                    logger.warning(f"Gemini transient ({response.status}): attempt {attempt + 1}/{max_retries + 1}, backoff {delay:.1f}s - {response_text[:200]}...")
-
-                    if attempt == max_retries:
-                        logger.error(f"Gemini max retries exceeded: {response.status}")
-                        raise Exception(f"Gemini API failed after {max_retries + 1} attempts: {response.status}")
-
-                    await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error(f"Request failed (final): {str(e)}")
-            raise
-        finally:
-            if session:
-                await session.close()
 
     async def send_request(self, request: Dict[str, Any]) -> ProxyResponse:
-        """Send non-streaming request to Gemini API."""
-        url = self._get_api_url(stream=False)
-        headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": self.api_key
-        }
+        logger.info(f"Sending request to Gemini OpenAI: {self.base_url}")
 
-        logger.info(f"Sending request to Gemini: {url}")
-        logger.info(f"=== CONVERTED GEMINI REQUEST ===\n{format_json_for_log(request)}")
+        # Configure HTTP client with proxy if specified
+        http_client = None
+        if self.proxy:
+            logger.info(f"Using proxy: {self.proxy}")
+            http_client = httpx.AsyncClient(proxy=self.proxy)
 
-        response = await self._make_post_request(url, request, headers)
-        logger.info(f"Gemini non-stream response status: {response.status}")
-        try:
-            response_text = await response.text()
-        except Exception as e:
-            logger.error(f"Failed to read Gemini response body: {e}")
-            response.release()
-            raise
-
-        logger.info(f"=== RAW GEMINI RESPONSE ===\n{format_json_for_log(response_text, max_str_length=15000)}")
-
-        gemini_response = json.loads(response_text)
-        usage = self.get_token_usage(gemini_response)
-        claude_response = self.convert_response(gemini_response)
-
-        logger.info(f"=== CONVERTED CLAUDE RESPONSE ===\n{format_json_for_log(claude_response)}")
-
-        return ProxyResponse(
-            data=claude_response,
-            usage=usage,
-            is_stream=False
+        client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout,
+            http_client=http_client
         )
+
+        try:
+            response = await client.chat.completions.create(**request)
+            gemini_response = response.model_dump()
+
+            logger.info(f"=== RAW GEMINI OPENAI RESPONSE ===\n{format_json_for_log(gemini_response)}")
+
+            usage = self.get_token_usage(gemini_response)
+            claude_response = self.convert_response(gemini_response)
+
+            return ProxyResponse(
+                data=claude_response,
+                usage=usage,
+                is_stream=False
+            )
+        except Exception as e:
+            logger.error(f"Gemini OpenAI API error: {str(e)}")
+            raise
+        finally:
+            if http_client:
+                await http_client.aclose()
 
     async def stream_request(
             self,
             request: Dict[str, Any]
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Send streaming request to Gemini API and yield Claude-formatted chunks."""
-        url = self._get_api_url(stream=True)
-        headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": self.api_key
-        }
-
-        logger.info(f"Sending streaming request to Gemini: {url}")
-        logger.info(f"=== CONVERTED GEMINI REQUEST (STREAM) ===\n{format_json_for_log(request)}")
+        logger.info(f"Sending streaming request to Gemini OpenAI: {self.base_url}")
+        logger.info(f"Tools count: {len(request.get('tools', []))}")
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-        content_block_index = 0
-        accumulated_text = ""
-        tool_calls = []
-        total_input_tokens = 0
-        total_output_tokens = 0
 
-        # Send message_start event
         yield {
             "type": "message_start",
             "message": {
@@ -544,162 +383,175 @@ class GeminiStrategy(BaseModelStrategy):
             }
         }
 
-        # In stream_request:
-        response = await self._make_post_request(url, request, headers)
-        logger.info(f"Gemini stream response status: {response.status}")
-        if response.status != 200:
-            try:
-                body_bytes = await response.content.read()
-                error_text = body_bytes.decode('utf-8', errors='ignore')
-            except:
-                error_text = "No body (connection closed)"
-            logger.error(f"Gemini streaming API error {response.status}: {format_json_for_log(error_text)} | Headers: {dict(response.headers)}")
-            response.release()
-            raise Exception(f"Gemini API error: {response.status} - {error_text[:500]}")
-
-        text_block_started = False
-
-        async for line in response.content:
-            line = line.decode('utf-8').strip()
-
-            if not line or not line.startswith('data: '):
-                continue
-
-            json_str = line[6:]  # Remove 'data: ' prefix
-            if not json_str or json_str == '[DONE]':
-                continue
-
-            try:
-                chunk = json.loads(json_str)
-            except json.JSONDecodeError:
-                continue
-
-            # Log streaming chunk
-            logger.debug(f"=== GEMINI STREAM CHUNK ===\n{format_json_for_log(chunk, max_str_length=2000)}")
-
-            # Extract usage metadata
-            usage_metadata = chunk.get("usageMetadata", {})
-            if usage_metadata:
-                total_input_tokens = usage_metadata.get("promptTokenCount", total_input_tokens)
-                total_output_tokens = usage_metadata.get("candidatesTokenCount", total_output_tokens)
-
-            candidates = chunk.get("candidates", [])
-            if not candidates:
-                continue
-
-            candidate = candidates[0]
-            content = candidate.get("content", {})
-            parts = content.get("parts", [])
-
-            for part in parts:
-                if "text" in part:
-                    text = part["text"]
-
-                    if not text_block_started:
-                        # Start content block
-                        yield {
-                            "type": "content_block_start",
-                            "index": content_block_index,
-                            "content_block": {"type": "text", "text": ""}
-                        }
-                        text_block_started = True
-
-                    # Send text delta
-                    yield {
-                        "type": "content_block_delta",
-                        "index": content_block_index,
-                        "delta": {"type": "text_delta", "text": text}
-                    }
-                    accumulated_text += text
-
-                elif "functionCall" in part:
-                    # End previous text block if any
-                    if text_block_started:
-                        yield {
-                            "type": "content_block_stop",
-                            "index": content_block_index
-                        }
-                        content_block_index += 1
-                        text_block_started = False
-
-                    # Start tool use block
-                    func_call = part["functionCall"]
-                    tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
-
-                    yield {
-                        "type": "content_block_start",
-                        "index": content_block_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tool_id,
-                            "name": func_call.get("name", ""),
-                            "input": {}
-                        }
-                    }
-
-                    # Send input as delta
-                    input_json = json.dumps(func_call.get("args", {}))
-                    yield {
-                        "type": "content_block_delta",
-                        "index": content_block_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": input_json
-                        }
-                    }
-
-                    yield {
-                        "type": "content_block_stop",
-                        "index": content_block_index
-                    }
-
-                    tool_calls.append({
-                        "id": tool_id,
-                        "name": func_call.get("name", ""),
-                        "input": func_call.get("args", {})
-                    })
-                    content_block_index += 1
-
-            # Check for finish
-            finish_reason = candidate.get("finishReason")
-            if finish_reason:
-                if text_block_started:
-                    yield {
-                        "type": "content_block_stop",
-                        "index": content_block_index
-                    }
-
-                # Map stop reason
-                stop_reason_map = {
-                    "STOP": "end_turn",
-                    "MAX_TOKENS": "max_tokens",
-                    "SAFETY": "stop_sequence"
-                }
-                stop_reason = stop_reason_map.get(finish_reason, "end_turn")
-                if tool_calls:
-                    stop_reason = "tool_use"
-
-                # Send message_delta with stop_reason
-                yield {
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": stop_reason,
-                        "stop_sequence": None
-                    },
-                    "usage": {"output_tokens": total_output_tokens}
-                }
-
-        # Send message_stop
-        yield {
-            "type": "message_stop"
+        url = f"{self.base_url}/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
         }
 
-        # Store final usage for logging
-        self._last_usage = TokenUsage(
-            input_tokens=total_input_tokens,
-            output_tokens=total_output_tokens
-        )
+        # Configure SSL context
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
 
+        # Configure proxy for aiohttp if specified
+        connector = None
+        if self.proxy:
+            logger.info(f"Using proxy for streaming: {self.proxy}")
+
+        try:
+            text_block_started = False
+            content_block_index = 0
+            total_output_tokens = 0
+            tool_calls_in_progress = {}  # Track tool calls being streamed
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                        url,
+                        json=request,
+                        headers=headers,
+                        proxy=self.proxy if self.proxy else None,
+                        ssl=ssl_context,
+                        timeout=aiohttp.ClientTimeout(total=self.timeout)
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"Gemini OpenAI streaming API error: {response.status} - {error_text}")
+                        raise Exception(f"Gemini OpenAI API error: {response.status} - {error_text}")
+
+                    async for line in response.content:
+                        line = line.decode('utf-8').strip()
+                        if not line or not line.startswith('data: '):
+                            continue
+
+                        json_str = line[6:]
+                        if json_str == '[DONE]':
+                            break
+
+                        try:
+                            chunk = json.loads(json_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
+
+                        delta = choices[0].get("delta", {})
+
+                        # Handle text content
+                        if "content" in delta and delta["content"]:
+                            content = delta["content"]
+                            if not text_block_started:
+                                yield {
+                                    "type": "content_block_start",
+                                    "index": content_block_index,
+                                    "content_block": {"type": "text", "text": ""}
+                                }
+                                text_block_started = True
+
+                            yield {
+                                "type": "content_block_delta",
+                                "index": content_block_index,
+                                "delta": {"type": "text_delta", "text": content}
+                            }
+
+                        # Handle tool calls (OpenAI/Gemini OpenAI format)
+                        if "tool_calls" in delta:
+                            # Close text block if open
+                            if text_block_started:
+                                yield {
+                                    "type": "content_block_stop",
+                                    "index": content_block_index
+                                }
+                                content_block_index += 1
+                                text_block_started = False
+
+                            for tool_call in delta["tool_calls"]:
+                                tc_index = tool_call.get("index", 0)
+
+                                # New tool call starting
+                                if "id" in tool_call:
+                                    tool_id = tool_call["id"]
+                                    func = tool_call.get("function", {})
+                                    tool_name = func.get("name", "")
+
+                                    # Extract thought_signature if present
+                                    extra_content = tool_call.get("extra_content", {})
+                                    google_data = extra_content.get("google", {})
+                                    thought_signature = google_data.get("thought_signature")
+
+                                    tool_calls_in_progress[tc_index] = {
+                                        "id": tool_id,
+                                        "name": tool_name,
+                                        "arguments": "",
+                                        "thought_signature": thought_signature
+                                    }
+
+                                    # Store thought_signature immediately if present
+                                    if thought_signature:
+                                        logger.info(f"Storing thought_signature for streaming tool_call {tool_id}")
+                                        self.thought_cache.store_signature(tool_id, thought_signature, msg_id)
+
+                                    yield {
+                                        "type": "content_block_start",
+                                        "index": content_block_index + tc_index,
+                                        "content_block": {
+                                            "type": "tool_use",
+                                            "id": tool_id,
+                                            "name": tool_name,
+                                            "input": {}
+                                        }
+                                    }
+
+                                # Streaming arguments
+                                if "function" in tool_call:
+                                    args_delta = tool_call["function"].get("arguments", "")
+                                    if args_delta and tc_index in tool_calls_in_progress:
+                                        tool_calls_in_progress[tc_index]["arguments"] += args_delta
+                                        yield {
+                                            "type": "content_block_delta",
+                                            "index": content_block_index + tc_index,
+                                            "delta": {
+                                                "type": "input_json_delta",
+                                                "partial_json": args_delta
+                                            }
+                                        }
+
+                        finish_reason = choices[0].get("finish_reason")
+                        if finish_reason:
+                            # Close text block if still open
+                            if text_block_started:
+                                yield {
+                                    "type": "content_block_stop",
+                                    "index": content_block_index
+                                }
+                                content_block_index += 1
+
+                            # Close all tool call blocks
+                            for tc_index in tool_calls_in_progress:
+                                yield {
+                                    "type": "content_block_stop",
+                                    "index": content_block_index + tc_index
+                                }
+
+                            stop_reason = "end_turn"
+                            if finish_reason == "length":
+                                stop_reason = "max_tokens"
+                            elif finish_reason == "tool_calls":
+                                stop_reason = "tool_use"
+
+                            yield {
+                                "type": "message_delta",
+                                "delta": {
+                                    "stop_reason": stop_reason,
+                                    "stop_sequence": None
+                                },
+                                "usage": {"output_tokens": total_output_tokens}
+                            }
+
+                    yield {"type": "message_stop"}
+        except Exception as e:
+            logger.error(f"Gemini OpenAI streaming API error: {str(e)}")
+            raise
 
 # Register strategy with factory
 StrategyFactory.register("gemini", GeminiStrategy)
