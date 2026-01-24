@@ -22,7 +22,7 @@ gemini:
 # Grok configuration
 grok:
   api_key: "${GROK_API_KEY}"
-  model: "grok-code-fast-1"
+  model: "grok-4-1-fast-reasoning"
   base_url: "https://api.x.ai/v1"
   timeout: 600
 
