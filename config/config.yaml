@@ -8,7 +8,7 @@ server:
 # Target model provider configuration
 provider:
   # Current active provider: grok (primary), auto-failover to fallback_providers
-  name: "gemini"
+  name: "deepseek"
   fallback_providers: ["gemini"]
 
 # Gemini configuration
@@ -30,3 +30,10 @@ grok:
 logging:
   level: "INFO"
   dir: "./logs"
+
+# DeepSeek configuration (Anthropic-compatible)
+deepseek:
+  api_key: ${DEEPSEEK_API_KEY}
+  model: deepseek-reasoner
+  base_url: https://api.deepseek.com/anthropic
+  timeout: 600
