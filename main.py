@@ -64,9 +64,7 @@ def format_json_for_log(data: Any, max_str_length: int = 500) -> str:
 
 
 from proxy.base import StrategyFactory
-# Import strategies to register them
-from proxy.gemini import GeminiStrategy  # noqa: F401
-from proxy.grok.converter import GrokStrategy  # noqa: F401
+# Strategies are automatically discovered and registered via proxy/__init__.py
 
 # Load configuration at module load time
 config.load()

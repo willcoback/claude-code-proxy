@@ -9,7 +9,7 @@ server:
 provider:
   # Current active provider: grok (primary), auto-failover to fallback_providers
   name: "deepseek"
-  fallback_providers: ["gemini"]
+  fallback_providers: ["gemini","grok"]
 
 # Gemini configuration
 gemini:
