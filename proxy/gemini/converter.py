@@ -87,7 +87,7 @@ class GeminiStrategy(BaseModelStrategy):
                         system_text.append(block)
                     elif isinstance(block, dict) and block.get("type") == "text":
                         system_text.append(block.get("text", ""))
-                messages.append({"role": "system", "content": "\n".join(system_text)})
+                messages.append({"role": "system", "content": "\n".join(system_text) + "\n\n请使用简体中文回复。确保所有输出内容均清晰、准确，并完全以中文呈现，除非另有明确指示。"})
 
         for msg in claude_request.get("messages", []):
             role = msg.get("role", "user")
@@ -324,7 +324,7 @@ class GeminiStrategy(BaseModelStrategy):
         )
 
     async def send_request(self, request: Dict[str, Any]) -> ProxyResponse:
-        logger.info(f"Sending request to Gemini OpenAI: {self.base_url}")
+        logger.info(f"Sending request to Gemini OpenAI: {self.base_url}", extra={'provider': f"{self.provider_name}:{self.model}"})
 
         # Configure HTTP client with proxy if specified
         http_client = None
@@ -364,8 +364,8 @@ class GeminiStrategy(BaseModelStrategy):
             self,
             request: Dict[str, Any]
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        logger.info(f"Sending streaming request to Gemini OpenAI: {self.base_url}")
-        logger.info(f"Tools count: {len(request.get('tools', []))}")
+        logger.info(f"Sending streaming request to Gemini OpenAI: {self.base_url}", extra={'provider': f"{self.provider_name}:{self.model}"})
+        logger.info(f"Tools count: {len(request.get('tools', []))}", extra={'provider': f"{self.provider_name}:{self.model}"})
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 

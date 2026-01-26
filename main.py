@@ -88,7 +88,9 @@ app = FastAPI(
 
 
 def get_strategy():
-    """Get the configured model strategy."""
+    """Get the configured model strategy, ensuring it's always up-to-date."""
+    # Ensure config is reloaded if file has changed
+    config.check_and_reload()
     provider_name = config.provider_name
     provider_config = config.get_provider_config(provider_name)
     return StrategyFactory.get_strategy(provider_name, provider_config)
@@ -127,7 +129,11 @@ async def messages(request: Request):
         body = await request.json()
         stream = body.get("stream", False)
 
-        logger.info(f"[{request_id}] Received request | stream={stream} | model={body.get('model', 'unknown')}")
+        logger.info(f"[{request_id}] Received request | stream={stream} | model={body.get('model', 'unknown')}", extra={'provider': 'proxy'})
+
+        # Check and reload configuration if changed
+        if config.check_and_reload():
+            logger.info(f"[{request_id}] Configuration reloaded from file", extra={'provider': 'config'})
 
         providers = [config.provider_name] + config.get("provider.fallback_providers", [])
         used_provider = None
@@ -140,7 +146,7 @@ async def messages(request: Request):
                 model_name = strategy.model
                 used_provider = provider_name
                 used_model = model_name
-                logger.info(f"[{request_id}] Using provider: {provider_name} ({model_name})")
+                logger.info(f"[{request_id}] Using provider: {provider_name} ({model_name})", extra={'provider': f"{provider_name}:{model_name}"})
 
                 if stream:
                     # Handle streaming response
@@ -229,7 +235,8 @@ async def messages(request: Request):
                     logger.info(
                         f"[{request_id}] Request completed | "
                         f"provider: {used_provider} | "
-                        f"tokens: {response.usage.total_tokens}"
+                        f"tokens: {response.usage.total_tokens}",
+                        extra={'provider': f"{used_provider}:{used_model}"}
                     )
 
                     return JSONResponse(

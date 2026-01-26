@@ -78,7 +78,7 @@ class GrokStrategy(BaseModelStrategy):
                         system_text.append(block)
                     elif isinstance(block, dict) and block.get("type") == "text":
                         system_text.append(block.get("text", ""))
-                messages.append({"role": "system", "content": "\n".join(system_text)})
+                messages.append({"role": "system", "content": "\n".join(system_text) + "\n\n请使用简体中文回复。确保所有输出内容均清晰、准确，并完全以中文呈现，除非另有明确指示。"})
 
         for msg in claude_request.get("messages", []):
             role = msg.get("role", "user")
@@ -297,7 +297,7 @@ class GrokStrategy(BaseModelStrategy):
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        logger.info(f"Sending request to Grok: {url}")
+        logger.info(f"Sending request to Grok: {url}", extra={'provider': f"{self.provider_name}:{self.model}"})
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -334,8 +334,8 @@ class GrokStrategy(BaseModelStrategy):
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        logger.info(f"Sending streaming request to Grok: {url}")
-        logger.info(f"Tools count: {len(request.get('tools', []))}")
+        logger.info(f"Sending streaming request to Grok: {url}", extra={'provider': f"{self.provider_name}:{self.model}"})
+        logger.info(f"Tools count: {len(request.get('tools', []))}", extra={'provider': f"{self.provider_name}:{self.model}"})
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 

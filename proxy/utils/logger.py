@@ -196,5 +196,6 @@ def log_request(
     logger.info(
         f"REQUEST | model={model_name} | "
         f"input_tokens={input_tokens} | output_tokens={output_tokens} | "
-        f"total_tokens={total_tokens} | status={status} | request_id={request_id}"
+        f"total_tokens={total_tokens} | status={status} | request_id={request_id}",
+        extra={'provider': model_name}
     )
