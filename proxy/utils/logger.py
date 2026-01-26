@@ -33,6 +33,10 @@ class HourlyRotatingFileHandler(TimedRotatingFileHandler):
         basename = Path(source_filename).stem.split('-')[0]  # Get 'proxy' from 'proxy-2026-01-23_13'
         return str(log_path / f"{basename}-{date_str}.log")
 
+    def should_rollover(self):
+        """Check if rollover needed."""
+        return self.get_current_filename() != self.baseFilename
+
     def doRollover(self):
         """Override to handle rollover with custom filename format."""
         if self.stream:
@@ -40,20 +44,20 @@ class HourlyRotatingFileHandler(TimedRotatingFileHandler):
             self.stream = None
 
         # Get current time for new filename
-        current_time = datetime.now()
-        new_filename = self.get_current_filename()
+        current_time_filename = self.get_current_filename()
 
-        # Update baseFilename to new time-based filename
-        self.baseFilename = new_filename
+        # If the filename has changed, update baseFilename
+        if current_time_filename != self.baseFilename:
+            self.baseFilename = current_time_filename
 
         # Open new log file
         self.mode = 'a'
         self.stream = self._open()
 
         # Calculate next rollover time
-        current_time_sec = self.rolloverAt - self.interval
+        current_time_sec = datetime.now().timestamp()
         new_rollover_at = self.computeRollover(current_time_sec)
-        while new_rollover_at <= current_time.timestamp():
+        while new_rollover_at <= current_time_sec:
             new_rollover_at = new_rollover_at + self.interval
         self.rolloverAt = new_rollover_at
 

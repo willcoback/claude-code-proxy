@@ -1,5 +1,6 @@
 """DeepSeek Anthropic-compatible model strategy implementation."""
 
+import copy
 import json
 import uuid
 from typing import Any, AsyncGenerator, Dict
@@ -53,16 +54,121 @@ class DeepSeekStrategy(BaseModelStrategy):
     def provider_name(self) -> str:
         return "deepseek"
 
+    @staticmethod
+    def _merge_content(content1: Any, content2: Any) -> Any:
+        """
+        Merge two content values according to Anthropic API format rules.
+
+        Args:
+            content1: First content (string or list of content blocks)
+            content2: Second content (string or list of content blocks)
+
+        Returns:
+            Merged content in valid Anthropic format
+        """
+        # Convert both to normalized form (list of content blocks)
+        def normalize(content):
+            if isinstance(content, str):
+                return [{"type": "text", "text": content}]
+            elif isinstance(content, list):
+                return content
+            else:
+                return []
+
+        normalized1 = normalize(content1)
+        normalized2 = normalize(content2)
+
+        # Merge the two lists
+        return normalized1 + normalized2
+
     def convert_request(self, claude_request: Dict[str, Any]) -> Dict[str, Any]:
         """
         Minimal conversion for DeepSeek Anthropic API.
         Directly forward Claude request with model/base_url adjustments.
+        Fix consecutive assistant messages for DeepSeek compatibility.
         """
-        # Copy request
-        req = claude_request.copy()
+        # Log original request messages structure
+        original_messages = claude_request.get("messages", [])
+        logger.info(
+            f"=== ORIGINAL REQUEST ({len(original_messages)} messages) ===\n"
+            f"{format_json_for_log(original_messages, max_str_length=200)}",
+            extra={'provider': f"{self.provider_name}:{self.model}"}
+        )
+
+        # Log system prompt if present
+        system_prompt = claude_request.get("system")
+        if system_prompt:
+            logger.info(
+                f"=== SYSTEM PROMPT ===\n{system_prompt}",
+                extra={'provider': f"{self.provider_name}:{self.model}"}
+            )
+
+        # Deep copy to avoid polluting original request
+        req = copy.deepcopy(claude_request)
 
         # Override model
         req["model"] = self.model  # e.g., "deepseek-chat"
+
+        # Fix consecutive assistant messages and add thinking block for tool_use
+        messages = req.get("messages", [])
+
+        # Remove prefill assistant messages (partial responses for format guidance)
+        # Claude Code uses prefill to guide output format, but DeepSeek doesn't support it well
+        if messages:
+            last_msg = messages[-1]
+            if last_msg.get("role") == "assistant":
+                content = last_msg.get("content", [])
+                # Check if this is a prefill (very short text content, typically just "{" or similar)
+                if isinstance(content, list) and len(content) == 1:
+                    block = content[0]
+                    if (block.get("type") == "text" and
+                        isinstance(block.get("text"), str) and
+                        len(block["text"].strip()) <= 5):  # Very short prefill
+                        logger.info(
+                            f"Detected and removing prefill assistant message: {block['text']!r}",
+                            extra={'provider': f"{self.provider_name}:{self.model}"}
+                        )
+                        messages.pop()  # Remove the prefill message
+
+        i = 0
+        while i < len(messages):
+            curr_msg = messages[i]
+
+            # If current message is assistant and has tool_use, ensure thinking block
+            if curr_msg.get("role") == "assistant":
+                content = curr_msg.get("content", [])
+                if isinstance(content, str):
+                    content = [{"type": "text", "text": content}]
+
+                has_tool_use = any(block.get("type") == "tool_use" for block in content)
+                has_thinking = any(block.get("type") == "thinking" for block in content)
+
+                if has_tool_use and not has_thinking:
+                    # Insert a thinking block at the beginning of content
+                    content.insert(0, {"type": "thinking", "thinking": "Thinking..."})
+                    curr_msg["content"] = content
+
+            # Handle consecutive assistant messages for merging
+            if i > 0:
+                prev_msg = messages[i-1]
+                if prev_msg.get("role") == "assistant" and curr_msg.get("role") == "assistant":
+                    # Merge content blocks safely using helper method
+                    prev_content = prev_msg.get("content", [])
+                    curr_content = curr_msg.get("content", [])
+                    prev_msg["content"] = self._merge_content(prev_content, curr_content)
+                    # Remove duplicate assistant message
+                    del messages[i]
+                    # Do not increment i, as the next message is now at current i
+                    continue
+            i += 1
+        req["messages"] = messages
+
+        # Log converted request messages structure
+        logger.info(
+            f"=== CONVERTED REQUEST ({len(messages)} messages) ===\n"
+            f"{format_json_for_log(messages, max_str_length=200)}",
+            extra={'provider': f"{self.provider_name}:{self.model}"}
+        )
 
         # DeepSeek ignores some fields but supports core: messages, system, tools, max_tokens, etc.
         # No major conversion needed (content blocks are compatible)
@@ -117,6 +223,10 @@ class DeepSeekStrategy(BaseModelStrategy):
         }
 
         logger.info(f"Sending request to DeepSeek: {url}", extra={'provider': f"{self.provider_name}:{self.model}"})
+        logger.info(
+            f"=== FULL REQUEST TO DEEPSEEK ===\n{format_json_for_log(request, max_str_length=300)}",
+            extra={'provider': f"{self.provider_name}:{self.model}"}
+        )
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -156,6 +266,10 @@ class DeepSeekStrategy(BaseModelStrategy):
 
         logger.info(f"Sending streaming request to DeepSeek: {url}", extra={'provider': f"{self.provider_name}:{self.model}"})
         logger.info(f"Tools count: {len(request.get('tools', []))}", extra={'provider': f"{self.provider_name}:{self.model}"})
+        logger.info(
+            f"=== FULL STREAMING REQUEST TO DEEPSEEK ===\n{format_json_for_log(request, max_str_length=300)}",
+            extra={'provider': f"{self.provider_name}:{self.model}"}
+        )
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -185,9 +299,6 @@ class DeepSeekStrategy(BaseModelStrategy):
                     logger.error(f"DeepSeek streaming API error: {response.status} - {error_text}")
                     raise Exception(f"DeepSeek API error: {response.status} - {error_text}")
 
-                text_block_started = False
-                content_block_index = 0
-                tool_calls_in_progress = {}
 
                 async for line in response.content:
                     line = line.decode('utf-8').strip()

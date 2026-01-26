@@ -5,11 +5,16 @@ server:
   host: "0.0.0.0"
   port: 8080
 
+# Logging configuration
+logging:
+  level: "INFO"
+  dir: "./logs"
+
 # Target model provider configuration
 provider:
   # Current active provider: grok (primary), auto-failover to fallback_providers
   name: "deepseek"
-  fallback_providers: ["gemini","grok"]
+  fallback_providers: ["gemini","grok","deepseek"]
 
 # Gemini configuration
 gemini:
@@ -26,10 +31,6 @@ grok:
   base_url: "https://api.x.ai/v1"
   timeout: 600
 
-# Logging configuration
-logging:
-  level: "INFO"
-  dir: "./logs"
 
 # DeepSeek configuration (Anthropic-compatible)
 deepseek:
