@@ -20,3 +20,40 @@ claude-code-proxy 返回数据给claude-code
 在包下区分模型厂商创建策略实现，如
 com.claude.proxy.gemini
 com.claude.proxy.grok
+
+## 自动发现机制
+
+项目实现了提供者自动发现机制，无需在 main.py 中手动导入新增的提供者策略。当 proxy 包被导入时，会自动执行以下操作：
+
+1. **扫描 proxy/ 目录**：查找所有包含 converter.py 文件的子目录（如 gemini/, grok/, deepseek/ 等）
+2. **动态导入**：自动导入每个 provider 目录下的 converter.py 模块
+3. **自动注册**：每个 converter.py 模块中的 StrategyFactory.register() 调用会在导入时执行，将提供者注册到策略工厂中
+
+## 扩展新的模型提供商
+
+新增模型提供商只需遵循以下规则：
+
+1. **创建目录**：在 `proxy/` 目录下创建新的提供商目录，如 `proxy/{provider_name}/`
+2. **实现策略**：创建 `converter.py` 文件，继承 `BaseModelStrategy` 并实现所有抽象方法
+3. **注册策略**：在 `converter.py` 末尾调用 `StrategyFactory.register("{provider_name}", {StrategyClassName})`
+4. **添加配置**：在 `config/config.yaml` 中添加对应提供商的配置节
+5. **无需修改代码**：不需要修改 main.py 或其他文件，重启服务即可生效
+
+示例目录结构：
+```
+proxy/
+├── base/
+│   └── strategy.py         # 策略模式基类
+├── gemini/
+│   └── converter.py        # Gemini 策略实现
+├── grok/
+│   └── converter.py        # Grok 策略实现
+├── deepseek/
+│   └── converter.py        # DeepSeek 策略实现
+└── __init__.py             # 自动发现逻辑
+```
+
+注意事项：
+- 提供者名称需与 config.yaml 中的配置节名称一致
+- 配置中的 `provider.name` 可随时热切换，无需重启服务
+- 日志会自动显示当前使用的提供商和模型名称

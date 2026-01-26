@@ -17,7 +17,8 @@
 | 提供商    | 状态    | 说明                      |
 |--------|-------|-------------------------|
 | Gemini | ✅ 已完成 | 完整支持 Google Gemini 系列模型 |
-| Grok   | ⏳ 待实现 | Xai Grok 模型（预留接口）       |
+| Grok   | ✅ 已完成 | 支持 Xai Grok 系列模型 |
+| DeepSeek | ✅ 已完成 | 支持 DeepSeek Anthropic 兼容 API |
 
 ## 项目结构
 
@@ -30,11 +31,15 @@ claude-code-proxy/
 │   └── config.yaml         # 配置文件
 ├── logs/                   # 日志目录（每日一个文件）
 ├── proxy/
+│   ├── __init__.py         # 自动发现机制入口
 │   ├── base/
 │   │   └── strategy.py     # 策略模式基类
 │   ├── gemini/
 │   │   └── converter.py    # Gemini 策略实现
-│   ├── grok/               # Grok 策略（待实现）
+│   ├── grok/
+│   │   └── converter.py    # Grok 策略实现
+│   ├── deepseek/
+│   │   └── converter.py    # DeepSeek 策略实现
 │   └── utils/
 │       ├── config.py       # 配置管理器
 │       └── logger.py       # 日志工具
@@ -59,6 +64,9 @@ GEMINI_API_KEY=your_gemini_api_key_here
 
 # Grok API 密钥（可选）
 GROK_API_KEY=your_grok_api_key_here
+
+# DeepSeek API 密钥（可选）
+DEEPSEEK_API_KEY=your_deepseek_api_key_here
 ```
 
 ### 3. 修改配置文件
@@ -71,19 +79,26 @@ server:
   port: 8080
 
 provider:
-  name: "gemini"            # 当前使用的提供商：gemini 或 grok
+  name: "deepseek"          # 当前使用的提供商：gemini、grok 或 deepseek
+  fallback_providers: ["gemini"]  # 备用提供商列表（主提供商失败时按顺序尝试）
 
 gemini:
   api_key: "${GEMINI_API_KEY}"
-  model: "gemini-2.0-flash" # 使用的模型
-  base_url: "https://generativelanguage.googleapis.com/v1beta"
-  timeout: 300
+  model: "gemini-2.5-flash" # 使用的模型
+  base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+  timeout: 600
 
 grok:
   api_key: "${GROK_API_KEY}"
-  model: "grok-beta"
+  model: "grok-4-1-fast-reasoning"
   base_url: "https://api.x.ai/v1"
-  timeout: 300
+  timeout: 600
+
+deepseek:
+  api_key: "${DEEPSEEK_API_KEY}"
+  model: "deepseek-reasoner"
+  base_url: "https://api.deepseek.com/anthropic"
+  timeout: 600
 
 logging:
   level: "INFO"
@@ -187,39 +202,73 @@ python tests/test_e2e.py
 
 ## 扩展新的模型提供商
 
-1. 在 `proxy/` 目录下创建新的提供商目录，如 `proxy/openai/`
+### 自动发现机制
 
-2. 继承 `BaseModelStrategy` 基类并实现所有抽象方法：
+项目实现了提供者自动发现机制，无需在 main.py 中手动导入新增的提供者策略。当 proxy 包被导入时，会自动执行以下操作：
+
+1. **扫描 proxy/ 目录**：查找所有包含 converter.py 文件的子目录（如 gemini/, grok/, deepseek/ 等）
+2. **动态导入**：自动导入每个 provider 目录下的 converter.py 模块
+3. **自动注册**：每个 converter.py 模块中的 `StrategyFactory.register()` 调用会在导入时执行，将提供者注册到策略工厂中
+
+### 添加新提供者步骤
+
+1. **创建目录**：在 `proxy/` 目录下创建新的提供商目录，如 `proxy/{provider_name}/`
+
+2. **实现策略**：创建 `converter.py` 文件，继承 `BaseModelStrategy` 并实现所有抽象方法：
 
 ```python
-from proxy.base.strategy import BaseModelStrategy, ProxyResponse
+from proxy.base.strategy import BaseModelStrategy, StrategyFactory, ProxyResponse
 
 
-class OpenAIStrategy(BaseModelStrategy):
+class NewProviderStrategy(BaseModelStrategy):
     @property
     def provider_name(self) -> str:
-        return "openai"
+        return "newprovider"  # 必须与 config.yaml 中的配置节名称一致
 
     def convert_request(self, claude_request: dict) -> dict:
-        # 将 Claude 请求格式转换为 OpenAI 格式
+        # 将 Claude 请求格式转换为目标模型格式
         pass
 
     def convert_response(self, model_response: dict) -> dict:
-        # 将 OpenAI 响应格式转换为 Claude 格式
+        # 将目标模型响应格式转换为 Claude 格式
         pass
 
     async def send_request(self, request: dict) -> ProxyResponse:
-        # 发送请求到 OpenAI API
+        # 发送请求到目标模型 API
         pass
 
     async def stream_request(self, request: dict):
         # 处理流式请求
         pass
+
+# 自动注册策略（无需修改 main.py）
+StrategyFactory.register("newprovider", NewProviderStrategy)
 ```
 
-3. 在 `config/config.yaml` 中添加新提供商的配置
+3. **添加配置**：在 `config/config.yaml` 中添加对应提供商的配置节：
 
-4. 注册策略到 `StrategyFactory`
+```yaml
+newprovider:
+  api_key: "${NEWPROVIDER_API_KEY}"
+  model: "newprovider-model"
+  base_url: "https://api.newprovider.com"
+  timeout: 600
+```
+
+4. **配置环境变量**：在 `.env` 文件中添加对应的 API 密钥：
+
+```bash
+NEWPROVIDER_API_KEY=your_api_key_here
+```
+
+5. **重启服务**：重启代理服务即可生效，无需修改 main.py 或其他代码
+
+### 注意事项
+
+- 提供者名称需与 config.yaml 中的配置节名称一致
+- 配置中的 `provider.name` 可随时热切换，无需重启服务
+- 日志会自动显示当前使用的提供商和模型名称
+- 系统支持配置热加载，修改 config.yaml 后新请求会立即生效
 
 ## 架构图
 
@@ -231,10 +280,11 @@ FastAPI Server (main.py)
 StrategyFactory
       ↓
 ┌─────────────────────┐
-│   Provider Strategy  │
+│   Provider Strategy │
 ├─────────────────────┤
 │  • Gemini (已实现)   │
-│  • Grok (待实现)     │
+│  • Grok (已实现)     │
+│  • DeepSeek (已实现) │
 │  • OpenAI (可扩展)   │
 └─────────────────────┘
       ↓
