@@ -33,8 +33,40 @@ class HourlyRotatingFileHandler(TimedRotatingFileHandler):
         basename = Path(source_filename).stem.split('-')[0]  # Get 'proxy' from 'proxy-2026-01-23_13'
         return str(log_path / f"{basename}-{date_str}.log")
 
-    def should_rollover(self):
-        """Check if rollover needed."""
+    def emit(self, record):
+        """
+        Emit a record, checking if log file still exists before writing.
+
+        If the log file was manually deleted, recreate it.
+        """
+        try:
+            # Check if the log file still exists
+            if self.stream and not Path(self.baseFilename).exists():
+                # File was deleted, close current stream and reopen
+                self.stream.close()
+                self.stream = None
+
+            # If stream is None, open the file
+            if self.stream is None:
+                self.stream = self._open()
+
+            # Call parent's emit to actually write the log
+            super().emit(record)
+        except Exception:
+            # If anything goes wrong, call parent's handleError
+            self.handleError(record)
+
+    def shouldRollover(self, record):
+        """
+        Check if rollover needed.
+        Override parent's shouldRollover to check filename changes.
+
+        Args:
+            record: Log record (required by parent class, unused here)
+
+        Returns:
+            True if rollover needed, False otherwise
+        """
         return self.get_current_filename() != self.baseFilename
 
     def doRollover(self):
@@ -73,6 +105,7 @@ class ProxyLogger:
     """Custom logger for claude-code-proxy with hourly rotation."""
 
     _loggers = {}
+    _chatlog_logger = None
 
     @classmethod
     def setup_logger(
@@ -157,6 +190,74 @@ class ProxyLogger:
             return cls.setup_logger(name)
         return cls._loggers[name]
 
+    @classmethod
+    def setup_chatlog_logger(
+            cls,
+            log_dir: str = "./logs",
+            level: str = "INFO"
+    ) -> logging.Logger:
+        """
+        Setup and return a chatlog logger for detailed request/response logging.
+
+        This logger writes detailed information including:
+        - Original request body
+        - Converted request body
+        - Model response
+        - Converted response
+
+        Args:
+            log_dir: Directory for log files
+            level: Logging level
+
+        Returns:
+            Configured chatlog logger instance
+        """
+        if cls._chatlog_logger is not None:
+            return cls._chatlog_logger
+
+        # Create logs directory if not exists
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+
+        # Create logger with unique name to avoid conflicts
+        logger = logging.getLogger("claude-code-proxy-chatlog")
+        logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+        logger.handlers = []  # Clear existing handlers
+        logger.propagate = False  # Don't propagate to parent loggers
+
+        # Create formatter (simpler format for chatlog)
+        file_formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)s|%(provider)s| | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+
+        # Hourly rotating file handler with timestamp in filename
+        current_hour = datetime.now().strftime('%Y-%m-%d_%H')
+        log_file = log_path / f"chatlog-{current_hour}.log"
+        file_handler = HourlyRotatingFileHandler(
+            filename=str(log_file),
+            when='H',
+            interval=1,
+            backupCount=1680,  # ~70 days
+            encoding='utf-8',
+            utc=False
+        )
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+
+        # Add provider filter
+        logger.addFilter(ProviderFilter("chatlog"))
+
+        cls._chatlog_logger = logger
+        return logger
+
+    @classmethod
+    def get_chatlog_logger(cls) -> logging.Logger:
+        """Get the chatlog logger, creating it if necessary."""
+        if cls._chatlog_logger is None:
+            return cls.setup_chatlog_logger()
+        return cls._chatlog_logger
+
 
 def setup_logger(
         name: str = "claude-code-proxy",
@@ -171,6 +272,11 @@ def setup_logger(
 def get_logger(name: str = "claude-code-proxy") -> logging.Logger:
     """Convenience function to get logger."""
     return ProxyLogger.get_logger(name)
+
+
+def get_chatlog_logger() -> logging.Logger:
+    """Convenience function to get chatlog logger."""
+    return ProxyLogger.get_chatlog_logger()
 
 
 def log_request(

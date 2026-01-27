@@ -8,9 +8,10 @@ from typing import Any, AsyncGenerator, Dict
 import aiohttp
 
 from ..base.strategy import BaseModelStrategy, StrategyFactory, TokenUsage, ProxyResponse
-from ..utils import get_logger
+from ..utils import get_logger, get_chatlog_logger, config
 
 logger = get_logger()
+chatlog = get_chatlog_logger()
 
 
 def truncate_value(value: Any, max_str_length: int = 500) -> Any:
@@ -87,21 +88,22 @@ class DeepSeekStrategy(BaseModelStrategy):
         Directly forward Claude request with model/base_url adjustments.
         Fix consecutive assistant messages for DeepSeek compatibility.
         """
-        # Log original request messages structure
-        original_messages = claude_request.get("messages", [])
-        logger.info(
-            f"=== ORIGINAL REQUEST ({len(original_messages)} messages) ===\n"
-            f"{format_json_for_log(original_messages, max_str_length=200)}",
-            extra={'provider': f"{self.provider_name}:{self.model}"}
-        )
-
-        # Log system prompt if present
-        system_prompt = claude_request.get("system")
-        if system_prompt:
-            logger.info(
-                f"=== SYSTEM PROMPT ===\n{system_prompt}",
+        # Log original request messages structure to chatlog
+        if config.chatlog_enabled:
+            original_messages = claude_request.get("messages", [])
+            chatlog.info(
+                f"=== ORIGINAL REQUEST ({len(original_messages)} messages) ===\n"
+                f"{format_json_for_log(original_messages, max_str_length=500)}",
                 extra={'provider': f"{self.provider_name}:{self.model}"}
             )
+
+            # Log system prompt if present to chatlog
+            system_prompt = claude_request.get("system")
+            if system_prompt:
+                chatlog.info(
+                    f"=== SYSTEM PROMPT ===\n{format_json_for_log(system_prompt, max_str_length=500)}",
+                    extra={'provider': f"{self.provider_name}:{self.model}"}
+                )
 
         # Deep copy to avoid polluting original request
         req = copy.deepcopy(claude_request)
@@ -163,12 +165,13 @@ class DeepSeekStrategy(BaseModelStrategy):
             i += 1
         req["messages"] = messages
 
-        # Log converted request messages structure
-        logger.info(
-            f"=== CONVERTED REQUEST ({len(messages)} messages) ===\n"
-            f"{format_json_for_log(messages, max_str_length=200)}",
-            extra={'provider': f"{self.provider_name}:{self.model}"}
-        )
+        # Log converted request messages structure to chatlog
+        if config.chatlog_enabled:
+            chatlog.info(
+                f"=== CONVERTED REQUEST ({len(messages)} messages) ===\n"
+                f"{format_json_for_log(messages, max_str_length=500)}",
+                extra={'provider': f"{self.provider_name}:{self.model}"}
+            )
 
         # DeepSeek ignores some fields but supports core: messages, system, tools, max_tokens, etc.
         # No major conversion needed (content blocks are compatible)
@@ -223,35 +226,44 @@ class DeepSeekStrategy(BaseModelStrategy):
         }
 
         logger.info(f"Sending request to DeepSeek: {url}", extra={'provider': f"{self.provider_name}:{self.model}"})
-        logger.info(
-            f"=== FULL REQUEST TO DEEPSEEK ===\n{format_json_for_log(request, max_str_length=300)}",
-            extra={'provider': f"{self.provider_name}:{self.model}"}
-        )
+        if config.chatlog_enabled:
+            chatlog.info(
+                f"=== FULL REQUEST TO DEEPSEEK ===\n{format_json_for_log(request, max_str_length=1000)}",
+                extra={'provider': f"{self.provider_name}:{self.model}"}
+            )
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url,
-                json=request,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=self.timeout)
-            ) as response:
-                response_text = await response.text()
+        client = self._get_http_client()
+        try:
+            response = await client.post(url, json=request, headers=headers)
+            response.raise_for_status()
+            response_text = response.text
 
-                if response.status != 200:
-                    logger.error(f"DeepSeek API error: {response.status} - {response_text}")
-                    raise Exception(f"DeepSeek API error: {response.status} - {response_text}")
-
-                logger.info(f"=== RAW DEEPSEEK RESPONSE ===\n{format_json_for_log(response_text)}")
-
-                deepseek_response = json.loads(response_text)
-                usage = self.get_token_usage(deepseek_response)
-                claude_response = self.convert_response(deepseek_response)
-
-                return ProxyResponse(
-                    data=claude_response,
-                    usage=usage,
-                    is_stream=False
+            if config.chatlog_enabled:
+                chatlog.info(
+                    f"=== RAW DEEPSEEK RESPONSE ===\n{format_json_for_log(response_text, max_str_length=1000)}",
+                    extra={'provider': f"{self.provider_name}:{self.model}"}
                 )
+
+            deepseek_response = json.loads(response_text)
+            usage = self.get_token_usage(deepseek_response)
+            claude_response = self.convert_response(deepseek_response)
+
+            if config.chatlog_enabled:
+                chatlog.info(
+                    f"=== CONVERTED CLAUDE RESPONSE ===\n{format_json_for_log(claude_response, max_str_length=1000)}",
+                    extra={'provider': f"{self.provider_name}:{self.model}"}
+                )
+
+            return ProxyResponse(
+                data=claude_response,
+                usage=usage,
+                is_stream=False
+            )
+        except Exception as e:
+            logger.error(f"DeepSeek API error: {str(e)}")
+            raise
+        finally:
+            await client.aclose()
 
     async def stream_request(
         self,
@@ -266,10 +278,11 @@ class DeepSeekStrategy(BaseModelStrategy):
 
         logger.info(f"Sending streaming request to DeepSeek: {url}", extra={'provider': f"{self.provider_name}:{self.model}"})
         logger.info(f"Tools count: {len(request.get('tools', []))}", extra={'provider': f"{self.provider_name}:{self.model}"})
-        logger.info(
-            f"=== FULL STREAMING REQUEST TO DEEPSEEK ===\n{format_json_for_log(request, max_str_length=300)}",
-            extra={'provider': f"{self.provider_name}:{self.model}"}
-        )
+        if config.chatlog_enabled:
+            chatlog.info(
+                f"=== FULL STREAMING REQUEST TO DEEPSEEK ===\n{format_json_for_log(request, max_str_length=1000)}",
+                extra={'provider': f"{self.provider_name}:{self.model}"}
+            )
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -287,20 +300,13 @@ class DeepSeekStrategy(BaseModelStrategy):
             }
         }
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url,
-                json=request,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=self.timeout)
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"DeepSeek streaming API error: {response.status} - {error_text}")
-                    raise Exception(f"DeepSeek API error: {response.status} - {error_text}")
+        client = self._get_http_client()
 
+        try:
+            async with client.stream("POST", url, json=request, headers=headers, timeout=self.timeout) as response:
+                response.raise_for_status()  # Raise an exception for bad status codes
 
-                async for line in response.content:
+                async for line in response.aiter_lines():
                     line = line.decode('utf-8').strip()
                     if not line.startswith('data: '):
                         continue
@@ -350,6 +356,8 @@ class DeepSeekStrategy(BaseModelStrategy):
                         yield chunk
 
                 yield {"type": "message_stop"}
+        finally:
+            await client.aclose()
 
 
 # Register strategy

@@ -9,12 +9,17 @@ server:
 logging:
   level: "INFO"
   dir: "./logs"
+  chatlog_enabled: true  # Enable detailed chatlog (request/response bodies)
 
 # Target model provider configuration
 provider:
-  # Current active provider: grok (primary), auto-failover to fallback_providers
-  name: "deepseek"
-  fallback_providers: ["gemini","grok","deepseek"]
+  # Current active provider: gemini (primary), auto-failover to fallback_providers
+  name: "gemini"
+  # Note: Do NOT include the primary provider in fallback list to avoid duplicate retries
+  fallback_providers: ["grok","deepseek"]
+
+# Global proxy configuration
+global_proxy: "http://127.0.0.1:7897"
 
 # Gemini configuration
 gemini:

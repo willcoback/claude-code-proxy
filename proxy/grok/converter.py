@@ -7,9 +7,10 @@ from typing import Any, AsyncGenerator, Dict
 import aiohttp
 
 from ..base.strategy import BaseModelStrategy, StrategyFactory, TokenUsage, ProxyResponse
-from ..utils import get_logger
+from ..utils import get_logger, get_chatlog_logger, config
 
 logger = get_logger()
+chatlog = get_chatlog_logger()
 
 
 def truncate_value(value: Any, max_str_length: int = 500) -> Any:
@@ -299,30 +300,38 @@ class GrokStrategy(BaseModelStrategy):
 
         logger.info(f"Sending request to Grok: {url}", extra={'provider': f"{self.provider_name}:{self.model}"})
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                    url,
-                    json=request,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=self.timeout)
-            ) as response:
-                response_text = await response.text()
+        client = self._get_http_client()
+        try:
+            response = await client.post(url, json=request, headers=headers)
+            response.raise_for_status()
+            response_text = response.text
 
-                if response.status != 200:
-                    logger.error(f"Grok API error: {response.status} - {response_text}")
-                    raise Exception(f"Grok API error: {response.status} - {response_text}")
-
-                logger.info(f"=== RAW GROK RESPONSE ===\n{format_json_for_log(response_text)}")
-
-                grok_response = json.loads(response_text)
-                usage = self.get_token_usage(grok_response)
-                claude_response = self.convert_response(grok_response)
-
-                return ProxyResponse(
-                    data=claude_response,
-                    usage=usage,
-                    is_stream=False
+            if config.chatlog_enabled:
+                chatlog.info(
+                    f"=== RAW GROK RESPONSE ===\n{format_json_for_log(response_text, max_str_length=1000)}",
+                    extra={'provider': f"{self.provider_name}:{self.model}"}
                 )
+
+            grok_response = json.loads(response_text)
+            usage = self.get_token_usage(grok_response)
+            claude_response = self.convert_response(grok_response)
+
+            if config.chatlog_enabled:
+                chatlog.info(
+                    f"=== CONVERTED CLAUDE RESPONSE ===\n{format_json_for_log(claude_response, max_str_length=1000)}",
+                    extra={'provider': f"{self.provider_name}:{self.model}"}
+                )
+
+            return ProxyResponse(
+                data=claude_response,
+                usage=usage,
+                is_stream=False
+            )
+        except Exception as e:
+            logger.error(f"Grok API error: {str(e)}")
+            raise
+        finally:
+            await client.aclose()
 
     async def stream_request(
             self,
@@ -336,6 +345,12 @@ class GrokStrategy(BaseModelStrategy):
 
         logger.info(f"Sending streaming request to Grok: {url}", extra={'provider': f"{self.provider_name}:{self.model}"})
         logger.info(f"Tools count: {len(request.get('tools', []))}", extra={'provider': f"{self.provider_name}:{self.model}"})
+
+        if config.chatlog_enabled:
+            chatlog.info(
+                f"=== STREAMING REQUEST TO GROK ===\n{format_json_for_log(request, max_str_length=1000)}",
+                extra={'provider': f"{self.provider_name}:{self.model}"}
+            )
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -353,24 +368,18 @@ class GrokStrategy(BaseModelStrategy):
             }
         }
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                    url,
-                    json=request,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=self.timeout)
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Grok streaming API error: {response.status} - {error_text}")
-                    raise Exception(f"Grok API error: {response.status} - {error_text}")
+        client = self._get_http_client()
+
+        try:
+            async with client.stream("POST", url, json=request, headers=headers, timeout=self.timeout) as response:
+                response.raise_for_status()  # Raise an exception for bad status codes
 
                 text_block_started = False
                 content_block_index = 0
                 total_output_tokens = 0
                 tool_calls_in_progress = {}  # Track tool calls being streamed
 
-                async for line in response.content:
+                async for line in response.aiter_lines():
                     line = line.decode('utf-8').strip()
                     if not line or not line.startswith('data: '):
                         continue
@@ -491,6 +500,8 @@ class GrokStrategy(BaseModelStrategy):
                         }
 
         yield {"type": "message_stop"}
+        finally:
+            await client.aclose()
 
 
 # Register strategy with factory

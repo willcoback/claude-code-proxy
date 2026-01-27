@@ -157,6 +157,12 @@ class Config:
         """Get server port."""
         return self.get('server.port', 8080)
 
+    @property
+    def chatlog_enabled(self) -> bool:
+        """Get chatlog enabled status (hot-reloadable)."""
+        self.check_and_reload()
+        return self.get('logging.chatlog_enabled', False)
+
     def get_provider_config(self, provider: str = None) -> Dict[str, Any]:
         """Get configuration for a specific provider."""
         self.check_and_reload()

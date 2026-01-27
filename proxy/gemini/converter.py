@@ -11,10 +11,11 @@ import httpx
 from openai import AsyncOpenAI
 
 from ..base.strategy import BaseModelStrategy, StrategyFactory, TokenUsage, ProxyResponse
-from ..utils import get_logger
+from ..utils import get_logger, get_chatlog_logger, config
 from ..utils.thought_cache import ThoughtSignatureCache
 
 logger = get_logger()
+chatlog = get_chatlog_logger()
 
 def truncate_value(value: Any, max_str_length: int = 500) -> Any:
     """
@@ -53,7 +54,7 @@ class GeminiStrategy(BaseModelStrategy):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.proxy = config.get('proxy', '')  # HTTP/HTTPS proxy URL
+        self.http_proxy = config.get('proxy', '')  # HTTP/HTTPS proxy URL
         self.thought_cache = ThoughtSignatureCache()  # Initialize thought signature cache
         # Cleanup old cache entries on startup
         self.thought_cache.cleanup_old_entries(max_age_seconds=3600, max_entries=1000)
@@ -260,7 +261,7 @@ class GeminiStrategy(BaseModelStrategy):
                 content.append({"type": "text", "text": content_text})
 
             # Handle tool calls
-            tool_calls = message.get("tool_calls", [])
+            tool_calls = message.get("tool_calls") or []
             for tc in tool_calls:
                 func = tc.get("function", {})
                 try:
@@ -326,27 +327,31 @@ class GeminiStrategy(BaseModelStrategy):
     async def send_request(self, request: Dict[str, Any]) -> ProxyResponse:
         logger.info(f"Sending request to Gemini OpenAI: {self.base_url}", extra={'provider': f"{self.provider_name}:{self.model}"})
 
-        # Configure HTTP client with proxy if specified
-        http_client = None
-        if self.proxy:
-            logger.info(f"Using proxy: {self.proxy}")
-            http_client = httpx.AsyncClient(proxy=self.proxy)
-
         client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
             timeout=self.timeout,
-            http_client=http_client
+            http_client=self._get_http_client()
         )
 
         try:
             response = await client.chat.completions.create(**request)
             gemini_response = response.model_dump()
 
-            logger.info(f"=== RAW GEMINI OPENAI RESPONSE ===\n{format_json_for_log(gemini_response)}")
+            if config.chatlog_enabled:
+                chatlog.info(
+                    f"=== RAW GEMINI OPENAI RESPONSE ===\n{format_json_for_log(gemini_response, max_str_length=1000)}",
+                    extra={'provider': f"{self.provider_name}:{self.model}"}
+                )
 
             usage = self.get_token_usage(gemini_response)
             claude_response = self.convert_response(gemini_response)
+
+            if config.chatlog_enabled:
+                chatlog.info(
+                    f"=== CONVERTED CLAUDE RESPONSE ===\n{format_json_for_log(claude_response, max_str_length=1000)}",
+                    extra={'provider': f"{self.provider_name}:{self.model}"}
+                )
 
             return ProxyResponse(
                 data=claude_response,
@@ -354,11 +359,19 @@ class GeminiStrategy(BaseModelStrategy):
                 is_stream=False
             )
         except Exception as e:
-            logger.error(f"Gemini OpenAI API error: {str(e)}")
+            error_msg = str(e)
+            logger.error(f"Gemini OpenAI API error: {error_msg}")
+
+            # Provide helpful hints for connection errors
+            if "Connection" in error_msg or "ConnectError" in error_msg:
+                if not self.http_proxy:
+                    logger.warning(
+                        "Connection failed to Gemini API. "
+                        "If you are in China, you may need to configure a proxy in config.yaml (gemini.proxy)"
+                    )
+                else:
+                    logger.warning(f"Connection failed even with proxy: {self.http_proxy}")
             raise
-        finally:
-            if http_client:
-                await http_client.aclose()
 
     async def stream_request(
             self,
@@ -366,6 +379,12 @@ class GeminiStrategy(BaseModelStrategy):
     ) -> AsyncGenerator[Dict[str, Any], None]:
         logger.info(f"Sending streaming request to Gemini OpenAI: {self.base_url}", extra={'provider': f"{self.provider_name}:{self.model}"})
         logger.info(f"Tools count: {len(request.get('tools', []))}", extra={'provider': f"{self.provider_name}:{self.model}"})
+
+        if config.chatlog_enabled:
+            chatlog.info(
+                f"=== STREAMING REQUEST TO GEMINI ===\n{format_json_for_log(request, max_str_length=1000)}",
+                extra={'provider': f"{self.provider_name}:{self.model}"}
+            )
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -389,13 +408,7 @@ class GeminiStrategy(BaseModelStrategy):
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        # Configure SSL context
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
-
-        # Configure proxy for aiohttp if specified
-        connector = None
-        if self.proxy:
-            logger.info(f"Using proxy for streaming: {self.proxy}")
+        client = self._get_http_client()
 
         try:
             text_block_started = False
@@ -403,21 +416,10 @@ class GeminiStrategy(BaseModelStrategy):
             total_output_tokens = 0
             tool_calls_in_progress = {}  # Track tool calls being streamed
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                        url,
-                        json=request,
-                        headers=headers,
-                        proxy=self.proxy if self.proxy else None,
-                        ssl=ssl_context,
-                        timeout=aiohttp.ClientTimeout(total=self.timeout)
-                ) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"Gemini OpenAI streaming API error: {response.status} - {error_text}")
-                        raise Exception(f"Gemini OpenAI API error: {response.status} - {error_text}")
+            async with client.stream("POST", url, json=request, headers=headers, timeout=self.timeout) as response:
+                response.raise_for_status()  # Raise an exception for bad status codes
 
-                    async for line in response.content:
+                async for line in response.aiter_lines():
                         line = line.decode('utf-8').strip()
                         if not line or not line.startswith('data: '):
                             continue
@@ -550,8 +552,21 @@ class GeminiStrategy(BaseModelStrategy):
 
                     yield {"type": "message_stop"}
         except Exception as e:
-            logger.error(f"Gemini OpenAI streaming API error: {str(e)}")
+            error_msg = str(e)
+            logger.error(f"Gemini OpenAI streaming API error: {error_msg}")
+
+            # Provide helpful hints for connection errors
+            if "Connection" in error_msg or "connect" in error_msg.lower():
+                if not self.http_proxy:
+                    logger.warning(
+                        "Connection failed to Gemini API. "
+                        "If you are in China, you may need to configure a proxy in config.yaml (gemini.proxy)"
+                    )
+                else:
+                    logger.warning(f"Connection failed even with proxy: {self.http_proxy}")
             raise
+        finally:
+            await client.aclose()
 
 # Register strategy with factory
 StrategyFactory.register("gemini", GeminiStrategy)

@@ -91,6 +91,8 @@ def get_strategy():
     config.check_and_reload()
     provider_name = config.provider_name
     provider_config = config.get_provider_config(provider_name)
+    # Add global proxy to provider config
+    provider_config["global_proxy"] = config.get("global_proxy", "")
     return StrategyFactory.get_strategy(provider_name, provider_config)
 
 
@@ -243,7 +245,10 @@ async def messages(request: Request):
                     )
 
             except Exception as e:
-                logger.warning(f"[{request_id}] Provider {provider_name} failed: {str(e)} | Trying next...")
+                logger.warning(
+                    f"[{request_id}] Provider {provider_name} failed: {str(e)} | Trying next...",
+                    exc_info=True
+                )
                 continue
 
         # All providers failed
