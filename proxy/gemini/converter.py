@@ -550,7 +550,7 @@ class GeminiStrategy(BaseModelStrategy):
                                 "usage": {"output_tokens": total_output_tokens}
                             }
 
-                    yield {"type": "message_stop"}
+                        yield {"type": "message_stop"}
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Gemini OpenAI streaming API error: {error_msg}")

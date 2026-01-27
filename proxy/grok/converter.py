@@ -499,7 +499,7 @@ class GrokStrategy(BaseModelStrategy):
                             "usage": {"output_tokens": total_output_tokens}
                         }
 
-        yield {"type": "message_stop"}
+                yield {"type": "message_stop"}
         finally:
             await client.aclose()
 
