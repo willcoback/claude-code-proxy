@@ -1,8 +1,13 @@
 #!/bin/bash
 
-# Claude Code Proxy Startup Script
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Get real script directory, handling symlinks (macOS compatible)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+  SOURCE="$(readlink "$SOURCE" )"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 PID_FILE="$SCRIPT_DIR/.proxy.pid"
 
 # Check if already running and restart if needed

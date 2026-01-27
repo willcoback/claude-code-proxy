@@ -117,6 +117,60 @@ python main.py
 
 服务默认运行在 `http://0.0.0.0:8080`
 
+### 4.1. 全局命令启动/停止服务 (推荐)
+
+为了方便在任意终端直接使用 `claude-proxy-start` 和 `claude-proxy-stop` 命令，你可以将脚本创建为全局软链接。
+
+**重要说明**：由于 `run.sh` 和 `stop.sh` 脚本在内部已更新以支持软链接的真实路径解析，无论软链接在哪里创建，脚本都能正确找到其所需的文件。
+
+**推荐步骤**：
+
+1.  **停止可能正在运行的服务**：
+    ```bash
+    ./stop.sh
+    ```
+
+2.  **创建全局软链接**：将 `run.sh` 和 `stop.sh` 链接到系统 PATH 包含的目录（如 `/usr/local/bin`）。这需要 `sudo` 权限。
+    ```bash
+    sudo ln -s "$(pwd)/run.sh" /usr/local/bin/claude-proxy-start
+    sudo ln -s "$(pwd)/stop.sh" /usr/local/bin/claude-proxy-stop
+    ```
+
+3.  **赋予执行权限**（通常软链接会继承，但为了确保）：
+    ```bash
+    sudo chmod +x /usr/local/bin/claude-proxy-start /usr/local/bin/claude-proxy-stop
+    ```
+
+4.  **在任意终端使用命令**：现在你可以在任何终端直接输入命令来启动或停止服务。
+    ```bash
+    claude-proxy-start
+    # ... 等待服务启动 ...
+    claude-proxy-stop
+    ```
+
+**可选方案：在项目内部创建软链接**
+
+如果你不希望在系统级别安装，也可以在项目根目录创建 `bin/` 目录，并在其中创建软链接。这种方式更适用于项目内部管理，但需要将 `bin/` 目录添加到 PATH 或使用相对路径执行（例如 `./bin/start.sh`）。
+
+```bash
+# 在项目根目录创建 bin/ 目录
+mkdir -p bin
+# 创建软链接
+ln -s "$(pwd)/run.sh" bin/start.sh
+ln -s "$(pwd)/stop.sh" bin/stop.sh
+# 赋予执行权限
+chmod +x bin/start.sh bin/stop.sh
+# 执行方式
+./bin/start.sh
+./bin/stop.sh
+```
+
+**注意事项**：
+-   在 `.gitignore` 文件中添加 `bin/` 目录，避免将项目内部的软链接提交到版本控制中。
+-   Windows 系统请使用 `mklink` 命令代替 `ln -s`。
+
+---
+
 ### 5. 配置 Claude Code 使用代理
 
 设置 Claude Code 的 API 端点指向本代理：
