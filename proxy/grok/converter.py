@@ -380,7 +380,7 @@ class GrokStrategy(BaseModelStrategy):
                 tool_calls_in_progress = {}  # Track tool calls being streamed
 
                 async for line in response.aiter_lines():
-                    line = line.decode('utf-8').strip()
+                    line = line.strip()
                     if not line or not line.startswith('data: '):
                         continue
 

@@ -92,7 +92,6 @@ def get_strategy():
     provider_name = config.provider_name
     provider_config = config.get_provider_config(provider_name)
     # Add global proxy to provider config
-    provider_config["global_proxy"] = config.get("global_proxy", "")
     return StrategyFactory.get_strategy(provider_name, provider_config)
 
 

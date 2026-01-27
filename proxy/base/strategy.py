@@ -46,14 +46,14 @@ class BaseModelStrategy(ABC):
         self.model = config.get('model', '')
         self.base_url = config.get('base_url', '')
         self.timeout = config.get('timeout', 300)
-        self.global_proxy = config.get('global_proxy', '')
+        self.provider_proxy = config.get('proxy', '')
 
     def _get_http_client(self) -> httpx.AsyncClient:
         """
         Returns an httpx.AsyncClient instance, configured with a proxy if specified.
         """
-        if self.global_proxy:
-            return httpx.AsyncClient(proxy=self.global_proxy, timeout=self.timeout)
+        if self.provider_proxy:
+            return httpx.AsyncClient(proxy=self.provider_proxy, timeout=self.timeout)
         else:
             return httpx.AsyncClient(timeout=self.timeout)
 

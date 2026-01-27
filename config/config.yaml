@@ -19,7 +19,6 @@ provider:
   fallback_providers: ["grok","deepseek"]
 
 # Global proxy configuration
-global_proxy: "http://127.0.0.1:7897"
 
 # Gemini configuration
 gemini:
@@ -27,7 +26,7 @@ gemini:
   model: "gemini-2.5-flash"  # 使用 Gemini 3，测试 thought_signature 缓存
   base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
   timeout: 600
-  proxy: ""  # Optional HTTP/HTTPS proxy (e.g., "http://127.0.0.1:7890")
+  proxy: "http://127.0.0.1:7897"
 
 # Grok configuration
 grok:
@@ -35,6 +34,7 @@ grok:
   model: "grok-4-1-fast-reasoning"
   base_url: "https://api.x.ai/v1"
   timeout: 600
+  proxy: "http://127.0.0.1:7897"
 
 
 # DeepSeek configuration (Anthropic-compatible)
@@ -43,3 +43,4 @@ deepseek:
   model: deepseek-reasoner
   base_url: https://api.deepseek.com/anthropic
   timeout: 600
+  proxy: ""
