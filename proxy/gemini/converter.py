@@ -54,7 +54,6 @@ class GeminiStrategy(BaseModelStrategy):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.http_proxy = config.get('proxy', '')  # HTTP/HTTPS proxy URL
         self.thought_cache = ThoughtSignatureCache()  # Initialize thought signature cache
         # Cleanup old cache entries on startup
         self.thought_cache.cleanup_old_entries(max_age_seconds=3600, max_entries=1000)
@@ -364,13 +363,13 @@ class GeminiStrategy(BaseModelStrategy):
 
             # Provide helpful hints for connection errors
             if "Connection" in error_msg or "ConnectError" in error_msg:
-                if not self.http_proxy:
+                if not self.global_proxy:
                     logger.warning(
                         "Connection failed to Gemini API. "
-                        "If you are in China, you may need to configure a proxy in config.yaml (gemini.proxy)"
+                        "If you are in China, you may need to configure a global_proxy in config.yaml"
                     )
                 else:
-                    logger.warning(f"Connection failed even with proxy: {self.http_proxy}")
+                    logger.warning(f"Connection failed even with global_proxy: {self.global_proxy}")
             raise
 
     async def stream_request(
@@ -557,13 +556,13 @@ class GeminiStrategy(BaseModelStrategy):
 
             # Provide helpful hints for connection errors
             if "Connection" in error_msg or "connect" in error_msg.lower():
-                if not self.http_proxy:
+                if not self.global_proxy:
                     logger.warning(
                         "Connection failed to Gemini API. "
-                        "If you are in China, you may need to configure a proxy in config.yaml (gemini.proxy)"
+                        "If you are in China, you may need to configure a global_proxy in config.yaml"
                     )
                 else:
-                    logger.warning(f"Connection failed even with proxy: {self.http_proxy}")
+                    logger.warning(f"Connection failed even with global_proxy: {self.global_proxy}")
             raise
         finally:
             await client.aclose()
