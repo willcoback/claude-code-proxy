@@ -1,11 +1,10 @@
 """DeepSeek Anthropic-compatible model strategy implementation."""
 
+import aiohttp
 import copy
 import json
 import uuid
 from typing import Any, AsyncGenerator, Dict
-
-import aiohttp
 
 from ..base.strategy import BaseModelStrategy, StrategyFactory, TokenUsage, ProxyResponse
 from ..utils import get_logger, get_chatlog_logger, config
@@ -307,7 +306,7 @@ class DeepSeekStrategy(BaseModelStrategy):
                 response.raise_for_status()  # Raise an exception for bad status codes
 
                 async for line in response.aiter_lines():
-                    line = line.decode('utf-8').strip()
+                    line = line.strip()
                     if not line.startswith('data: '):
                         continue
 
