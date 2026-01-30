@@ -38,9 +38,19 @@ if [ -z "$GEMINI_API_KEY" ]; then
     echo "Please set it in .env file or export it"
 fi
 
-# Start the proxy server
+# Create logs directory if it doesn't exist (same as logger.py)
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+
+# Generate timestamp for log filename (same format as logger.py)
+CURRENT_HOUR=$(date '+%Y-%m-%d_%H')
+RUN_LOG="$LOG_DIR/run-${CURRENT_HOUR}.log"
+
+# Start the proxy server with nohup to detach from terminal
 echo "Starting Claude Code Proxy..."
+echo "$(date '+%Y-%m-%d %H:%M:%S') Starting Claude Code Proxy..." >> "$RUN_LOG"
 cd "$SCRIPT_DIR"
-python main.py &
+nohup python main.py >> "$RUN_LOG" 2>&1 &
 echo $! > "$PID_FILE"
 echo "Claude Code Proxy started (PID: $(cat $PID_FILE))"
+echo "$(date '+%Y-%m-%d %H:%M:%S') Claude Code Proxy started (PID: $(cat $PID_FILE))" >> "$RUN_LOG"
