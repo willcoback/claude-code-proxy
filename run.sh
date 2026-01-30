@@ -46,11 +46,24 @@ mkdir -p "$LOG_DIR"
 CURRENT_HOUR=$(date '+%Y-%m-%d_%H')
 RUN_LOG="$LOG_DIR/run-${CURRENT_HOUR}.log"
 
+# Determine Python interpreter
+PYTHON_CMD=""
+if [ -f ".venv/bin/python" ]; then
+    PYTHON_CMD=".venv/bin/python"
+elif command -v python3 > /dev/null 2>&1; then
+    PYTHON_CMD="python3"
+elif command -v python > /dev/null 2>&1; then
+    PYTHON_CMD="python"
+else
+    echo "Error: No Python interpreter found. Please install Python 3."
+    exit 1
+fi
+
 # Start the proxy server with nohup to detach from terminal
-echo "Starting Claude Code Proxy..."
-echo "$(date '+%Y-%m-%d %H:%M:%S') Starting Claude Code Proxy..." >> "$RUN_LOG"
+echo "Starting Claude Code Proxy using $PYTHON_CMD..."
+echo "$(date '+%Y-%m-%d %H:%M:%S') Starting Claude Code Proxy using $PYTHON_CMD..." >> "$RUN_LOG"
 cd "$SCRIPT_DIR"
-nohup .venv/bin/python main.py >> "$RUN_LOG" 2>&1 &
+nohup $PYTHON_CMD main.py >> "$RUN_LOG" 2>&1 &
 echo $! > "$PID_FILE"
 echo "Claude Code Proxy started (PID: $(cat $PID_FILE))"
 echo "$(date '+%Y-%m-%d %H:%M:%S') Claude Code Proxy started (PID: $(cat $PID_FILE))" >> "$RUN_LOG"
