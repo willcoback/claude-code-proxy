@@ -50,7 +50,7 @@ RUN_LOG="$LOG_DIR/run-${CURRENT_HOUR}.log"
 echo "Starting Claude Code Proxy..."
 echo "$(date '+%Y-%m-%d %H:%M:%S') Starting Claude Code Proxy..." >> "$RUN_LOG"
 cd "$SCRIPT_DIR"
-nohup python main.py >> "$RUN_LOG" 2>&1 &
+nohup .venv/bin/python main.py >> "$RUN_LOG" 2>&1 &
 echo $! > "$PID_FILE"
 echo "Claude Code Proxy started (PID: $(cat $PID_FILE))"
 echo "$(date '+%Y-%m-%d %H:%M:%S') Claude Code Proxy started (PID: $(cat $PID_FILE))" >> "$RUN_LOG"

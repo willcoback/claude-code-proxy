@@ -2,19 +2,19 @@
 
 # Server configuration
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8888
 
 # Logging configuration
 logging:
   level: "INFO"
   dir: "./logs"
-  chatlog_enabled: true  # Enable detailed chatlog (request/response bodies)
+  chatlog_enabled: false  # Enable detailed chatlog (request/response bodies)
 
 # Target model provider configuration
 provider:
   # Current active provider: gemini (primary), auto-failover to fallback_providers
-  name: "gemini"
+  name: "deepseek"
   # Note: Do NOT include the primary provider in fallback list to avoid duplicate retries
   fallback_providers: ["grok","deepseek"]
 
@@ -26,7 +26,7 @@ gemini:
   model: "gemini-2.5-flash"  # 使用 Gemini 3，测试 thought_signature 缓存
   base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
   timeout: 600
-  proxy: "http://127.0.0.1:7897"
+  proxy: ""
 
 # Grok configuration
 grok:
@@ -34,7 +34,7 @@ grok:
   model: "grok-4-1-fast-reasoning"
   base_url: "https://api.x.ai/v1"
   timeout: 600
-  proxy: "http://127.0.0.1:7897"
+  proxy: ""
 
 
 # DeepSeek configuration (Anthropic-compatible)
